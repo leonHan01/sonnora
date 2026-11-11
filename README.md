@@ -1,131 +1,165 @@
-# 声屿 · Sonora
+# Sonora · 声屿
 
-一款使用 SwiftUI、AppKit 和 AVFoundation 编写的 macOS 原生本地音乐播放器。深色界面与浅绿色点缀，无第三方依赖、无账号、无网络服务。
+**English** | [简体中文](README.zh-CN.md)
 
-1.1.7 更新：继续优化滚动、滑块拖动和窗口缩放时的界面更新。音量与选中状态独立刷新，未变化的歌曲行复用视图；点击歌曲只高亮，不再自动居中滚动，「定位当前」保持可用。封面按显示尺寸后台预解码，离屏取消加载并释放行内图片；窗口尺寸约束仅在变化时写入。
+A native macOS music player built with SwiftUI, AppKit, and AVFoundation. Sonora brings your local music, playlists, and listening statistics together in a dark interface with soft green accents. It also connects to a compatible music server and caches downloaded tracks for offline listening.
 
-1.1.6 更新：优化页面操作性能。歌曲筛选、排序、歌手分组和统计采用有容量上限的缓存；歌曲、队列和歌单查找复用索引，列表刷新不再复制整份编号数组。收藏、播放计数、导入和歌单编辑后会更新相关结果。自动保存的 JSON 编码和磁盘写入移到后台，退出时按顺序保存最新状态。
+No third-party dependencies. The application interface is currently in Simplified Chinese.
 
-1.1.5 更新：mini 播放器新增播放顺序菜单，点击当前模式图标可直接选择顺序播放、列表循环、单曲循环或随机播放，与完整播放器同步。
+## Features
 
-1.1.4 更新：修复 mini 模式窗口可以被拖大，导致播放器周围出现大片空白的问题。mini 窗口保持固定大小，仍可拖动位置；切回完整窗口后恢复原有大小和位置。
+- **Local library:** import files or folders recursively, drag music into the window, or use Finder’s **Open With** menu. Duplicate file paths are skipped.
+- **Playback controls:** play, pause, stop, seek, adjust volume, and mute. Choose sequential playback, repeat all, repeat one, or shuffle.
+- **Mini player:** a movable, fixed-size 380 × 124-point player with artwork, track information, playback controls, a progress bar, and a playback-mode menu. Returning to the full player restores its previous window size and position.
+- **Library organization:** browse all music, the 50 most recently added tracks, favorites, and custom playlists. Create, rename, and delete playlists, or add tracks using the “＋” menu.
+- **Artists and statistics:** browse artist pages with track counts and play counts. Search tracks by title, artist, album, or filename; sort tracks by date added, title, artist, or play count, and artists by name, play count, or track count.
+- **Playback queue:** view upcoming tracks, play a track next, remove queue entries, or clear upcoming tracks.
+- **Track information:** read embedded titles, artists, albums, artwork, and duration. Filenames are used when title tags are missing; tracks without artwork use a plain dark placeholder.
+- **Find the current track:** click **定位当前**, click the artwork or track information in the playback bar, or press `⌘J` to reveal and highlight the playing track.
+- **Online and offline listening:** browse server tracks, download on first playback, and keep listening to local and cached music when the server is unavailable.
+- **Native integration:** macOS Now Playing information and media commands, keyboard shortcuts, and saved library and playback state. Playback stays paused when the app is reopened.
 
-1.1.3 更新：收紧新建 / 重命名歌单弹窗，并压缩曲库标题、歌曲列表、歌手卡片、侧栏、播放队列及播放栏的多余留白，让窗口内显示更多歌曲和歌手。
+Supported file extensions: **MP3, M4A, AAC, WAV, AIF, AIFF, CAF, and FLAC**. Actual codec support depends on macOS decoding capabilities.
 
-1.1.2 更新：歌手列表排序菜单增加「歌曲数量」，按当前曲库歌曲数从多到少排列，数量相同时按歌手名称排列。
+## Requirements
 
-1.1.1 更新：收紧完整播放器顶部留白，将侧栏标识与搜索栏的顶部内边距统一为 12；歌曲内容区域相应上移。
+- macOS **14.0 or later**.
+- Packaged builds described here target **Apple Silicon**. Source builds can target `arm64` or `x86_64`; Intel builds have not been verified on a physical Intel Mac.
+- To build from source: Xcode or Apple Command Line Tools with **Swift 6.0 or later**.
 
-1.1.0 更新：新增歌曲与歌手播放次数统计。侧栏「所有歌手」展示曲库中的全部歌手、歌曲数量及播放次数，支持搜索和按播放次数排序；点击歌手可查看、搜索及播放其歌曲。歌曲列表增加播放次数列和排序，也可点击歌曲行的歌手名称直接进入详情。
+## Installation
 
-1.0.9 更新：进一步缩小 mini 播放器上下留白。
+If you have a packaged DMG, open it and drag **声屿.app** into **Applications**. Quit the previous version before replacing it when upgrading. Your library and playlists are stored separately from the app bundle.
 
-1.0.8 更新：缩小 mini 播放器，收紧歌曲信息与播放控件的间距。
+Current builds use ad hoc signing and are not signed with an Apple Developer certificate or notarized. If macOS blocks the app, allow it in **System Settings → Privacy & Security**.
 
-1.0.7 更新：mini 播放器新增专辑封面、歌曲名、歌手及专辑信息，播放按钮保持居中。
+To create an app bundle yourself, follow [Build from source](#build-from-source).
 
-1.0.6 更新：新增 mini 模式。点击底部播放栏右侧的缩小按钮，或按 `⌥⌘M`，将窗口切换为仅保留进度条、播放 / 暂停、停止、上一首、下一首和恢复按钮的小播放器。停止会回到当前歌曲开头；切换模式保持播放，退出 mini 恢复原窗口大小和位置。
+## Getting started
 
-1.0.5 更新：修复播放时右键菜单及「添加到歌单」子菜单不断刷新的闪烁问题。播放进度改为独立更新，只刷新进度条区域，菜单可以保持稳定展开。
+### Local music
 
-1.0.4 更新：歌曲列表和底部播放栏的红心旁新增「＋」，点击即可选择歌单快速加入。已加入的歌单会标记勾选并禁用重复添加，也可直接「新建歌单并添加」。
+1. Click **添加我的音乐** (“Add My Music”) or press `⌘O` to select audio files or folders. You can also drag them into the window.
+2. Double-click a track to play it. A single click selects it without automatically scrolling the list.
+3. Use the heart to favorite a track and “＋” to add it to a playlist. Right-click a track for more actions, including revealing its file in Finder or removing it from the library.
+4. Press `⌥⌘M` to switch between the full player and mini player.
 
-1.0.3 更新：新增「定位当前」按钮，点击底部正在播放的封面 / 歌曲信息或按 `⌘J` 也可定位。会清空搜索、在需要时切换到全部音乐，居中滚动并高亮当前歌曲；可连续重复定位，暂停时同样可用。
+Local music stays at its original location: importing does not copy files, and removing a library entry does not delete the original. If you move a music file, remove the unavailable entry and import it again.
 
-1.0.2 更新：无专辑封面时统一显示深灰色纯色块，去掉默认封面的渐变、圆环、波形图标和描边。歌曲列表、播放队列及底部播放栏统一使用这个简洁样式。
+Closing the window allows playback to continue in the background. Use `⌘Q` to quit the app.
 
-1.0.1 更新：歌曲列表封面由 39 调整为 52，歌名由 12 调整为 16，艺术家文字由 10 调整为 12；同时放大列表中的操作图标、专辑和时长文字，并增加行高。播放队列中的封面和文字也同步放大。长歌名可悬停查看完整内容。
+### Server connection
 
-## 打开应用
+Online mode is enabled by default with a preconfigured server address. You can change the server or disable online mode for local-only use:
 
-打开 DMG 后，将 **声屿.app** 拖到「Applications」文件夹。升级时先退出旧版，再替换应用；曲库和歌单会保留。预编译版本适用于 **Apple Silicon，macOS 14 或更高版本**。
+1. Open **服务器连接…** (“Server Connection”) from the application menu, or click the online/offline status in the sidebar.
+2. Enter the server’s HTTPS base URL and, if required, its access token. Local development also accepts HTTP on `localhost`, `127.0.0.1`, or `::1`.
+3. Click **保存并连接** (“Save and Connect”). Leave the token field empty to retain the token already saved for that server, or select the clear-token option to remove it.
 
-当前为本地开发签名版本，尚未经过 Apple 开发者证书签名和公证。若系统阻止打开，可在「系统设置 → 隐私与安全性」中允许本次打开。
+While online mode is enabled, the app refreshes the connection and track list every 30 seconds. Connection or download failures switch the library to local and already-cached music. Uncached server tracks require a working connection; their first playback waits for the download to complete. Downloads are checked against the server’s file size and SHA-256 digest before being cached.
 
-首次打开后，点击「添加我的音乐」，或将歌曲 / 文件夹拖入窗口。支持多文件选择、递归导入文件夹，以及通过 Finder 的「打开方式」导入。支持 MP3、M4A、AAC、WAV、AIFF、CAF、FLAC；具体编码以系统解码能力为准。
+Access tokens are stored in macOS Keychain, separately for each server. The **打开歌曲管理** (“Open Music Management”) button opens the server’s `/music.html` page in your browser.
 
-## 功能
+A compatible server is required; its backend is not included in this repository. The client expects:
 
-- 播放、暂停、上一首、下一首、进度拖动、音量和静音。
-- mini 模式：380 × 124 内容尺寸的固定大小小播放器，可移动窗口，展示歌曲信息和专辑封面，支持选择播放顺序、停止归零、进度拖动与快速恢复完整窗口。
-- 顺序播放、列表循环、单曲循环、随机播放。
-- 自动读取歌曲名称、艺术家、专辑、封面和时长；无标签时使用文件名。
-- 本地曲库、最近添加、收藏，以及可创建、重命名、删除的歌单。
-- 歌曲播放次数自动保存；每次成功开始播放计一次，暂停续播和拖动进度不重复计数，重新选播、停止后播放和循环重播会累计。旧曲库从升级后开始记录，历史次数初始为 0；重新打开应用保持暂停，开始播放时记录新的一次。
-- 「所有歌手」页面展示全部歌手及其歌曲数量、累计播放次数；歌手次数为其当前曲库歌曲的播放次数之和，移除歌曲后相应更新。歌手按标签归类，忽略名称首尾空白及大小写，合作歌手标签保留为一个条目。
-- 点击歌手卡片或歌曲行中的歌手名称查看其歌曲列表，支持播放全部、随机播放、搜索、收藏及加入歌单；可返回所有歌手。
-- 搜索歌曲 / 艺术家 / 专辑，按添加时间、名称、艺术家或播放次数排序；歌手页面支持搜索名称及按名称、播放次数、歌曲数量排序。
-- 展开播放队列、安排下一首、移除队列歌曲、清空待播。
-- 歌曲右键菜单支持收藏、添加到歌单、在 Finder 中显示和从曲库移除。
-- 记住曲库、收藏、歌单、音量、队列和播放位置；重新打开后保持暂停。
-- 接入 macOS「正在播放」信息与媒体控制命令。
-- 文件去重；损坏文件、丢失文件与保存失败显示提示。
-
-音乐保留在原始路径，不复制或删除原始文件。移动原始文件后，请移除失效条目并重新导入。退出应用使用 `⌘Q`；关闭窗口后仍可在后台继续播放。
-
-## 快捷键
-
-| 快捷键 | 操作 |
+| Endpoint | Purpose |
 | --- | --- |
-| `⌘O` | 导入歌曲或文件夹 |
-| `空格` / `⌘P` | 播放 / 暂停 |
-| `←` / `→` | 后退 / 前进 5 秒 |
-| `⌘←` / `⌘→` | 上一首 / 下一首 |
-| `⌘F` | 搜索音乐 |
-| `⇧⌘N` | 新建歌单 |
-| `⌘R` | 切换播放模式 |
-| `⌘L` | 展开 / 收起队列 |
-| `⌘J` | 定位当前歌曲 |
-| `⇧⌘M` | 静音 / 取消静音 |
-| `⌥⌘M` | 进入 / 退出 mini 模式 |
+| `GET /api/music/tracks` | Return a JSON array of track metadata. |
+| `GET /api/music/tracks/{id}/audio` | Download a track’s audio file. |
+| `/music.html` | Browser-based music management page. |
 
-在搜索框和歌单名称输入框内，空格与方向键正常编辑文字。
+Metadata fields are `id` (UUID), `title`, `artist`, `album`, `duration` (seconds), `extension`, `sha256`, `size` (bytes), and `uploadedAt` (ISO 8601). The client accepts supported lowercase extensions, lowercase SHA-256 digests, and files up to 128 MiB. API requests send `Authorization: Bearer <token>` when a token is configured. See [OnlineLibrary.swift](Sources/Sonora/OnlineLibrary.swift) for the client contract.
 
-## 从源码构建
+## Keyboard shortcuts
 
-安装 Xcode 或 Apple Command Line Tools，使用 Swift 6.0 或以上版本。在项目目录运行：
+| Shortcut | Action |
+| --- | --- |
+| `⌘O` | Import audio files or folders |
+| `Space` / `⌘P` | Play / pause |
+| `←` / `→` | Seek backward / forward 5 seconds |
+| `⌘←` / `⌘→` | Previous / next track |
+| `⌘F` | Search music |
+| `⇧⌘N` | Create a playlist |
+| `⌘R` | Cycle playback modes |
+| `⌘L` | Show / hide the queue |
+| `⌘J` | Reveal the current track |
+| `⇧⌘M` | Mute / unmute |
+| `⌥⌘M` | Enter / exit mini mode |
+| `⌘Q` | Quit |
+
+Space and arrow keys retain their normal editing behavior in text fields.
+
+## Build from source
+
+From the repository root, run:
 
 ```sh
 bash Scripts/build.sh
 ```
 
-应用输出到 `dist/声屿.app`。脚本使用本机架构；Intel 构建可指定 `bash Scripts/build.sh x86_64`，Apple Silicon 构建可指定 `bash Scripts/build.sh arm64`。
+The script builds a release executable for the current machine’s architecture, generates the app icon, creates `dist/声屿.app`, and applies and verifies an ad hoc signature. It does not launch the application.
+
+You can also select an architecture explicitly:
 
 ```sh
-bash Scripts/test.sh
+# Apple Silicon
+bash Scripts/build.sh arm64
+
+# Intel
+bash Scripts/build.sh x86_64
 ```
 
-51 项测试覆盖播放队列边界、循环 / 随机规则、播放顺序选择及保存、移除当前歌曲、原子保存与恢复、文件夹扫描去重、MP3 元数据 / 解码、损坏音频拒绝、当前歌曲定位、快速加入歌单、播放进度与菜单刷新的隔离、停止归零与位置保存，以及旧曲库统计兼容、播放计数与恢复、歌手分组 / 搜索 / 导航和移除后的统计更新。另覆盖页面缓存失效、筛选后的行标识、后台保存响应、退出保存顺序、写入失败提示、音量与选择更新隔离，以及静音 / 音量恢复。测试资源是自行生成的 12 秒静音 MP3，无第三方音乐版权内容。
+Open `Package.swift` in Xcode to work on the project. Full Xcode is not required by the build script, and build caches default to the project’s `.build/` directory.
 
-无需启动窗口或音频的页面数据性能检查：
+| Environment variable | Purpose |
+| --- | --- |
+| `SONORA_BUILD_ROOT` | Override the build and compiler-cache directory used by the scripts. |
+| `SONORA_APP_OUTPUT` | Override the app bundle output path used by `Scripts/build.sh`. |
+| `SONORA_LIBRARY_PATH` | Override the library JSON path when launching the app for development. Settings and audio cache are placed beside it. |
 
-```sh
-bash Scripts/test-performance.sh
+## Tests and validation
+
+Use the repository’s shell scripts to compile and run the test executables:
+
+| Command | Coverage |
+| --- | --- |
+| `bash Scripts/test.sh` | Queue rules, playback state, persistence, import and decoding, playlists, current-track navigation, artist statistics, caching, and isolated progress/volume/selection updates. |
+| `bash Scripts/test-online.sh` | Mocked server authentication, timeout fallback and recovery, stable identities, compatibility, offline cache availability, and download integrity. No windows or audio playback. |
+| `bash Scripts/test-performance.sh` | Page-data reads for 5,000 simulated tracks; each warmed-up case has a total budget of 100 ms for 8 refreshes. |
+| `bash Scripts/test-rendering.sh` | Row values, update boundaries, layout breakpoints, window-constraint logic, and background artwork loading, caching, and cancellation. |
+| `bash Scripts/test-mini-window.sh` | Mini/full window constraints and restoration using an offscreen test window. |
+| `bash Scripts/test-mini-window-scene.sh` | Production SwiftUI window configuration using a transparent, noninteractive test window. |
+
+The core tests use a generated 12-second silent MP3 fixture and do not play audio, but decoding checks need access to macOS audio services. The performance and rendering-contract checks do not create windows or play audio. Mini-window checks create test windows and require a working macOS window service. Tests use isolated library paths.
+
+Data benchmarks and view-value checks do not measure actual rendering frame rates. Historical verification results and their limits are recorded in [VALIDATION.md](VALIDATION.md) (Chinese).
+
+## Data and playback counts
+
+Default data directory:
+
+```text
+~/Library/Application Support/Sonora/
+├── library.json          # Track index, playlists, favorites, counts, and playback state
+├── online-settings.json  # Server address and online-mode setting
+└── online-audio/         # Downloaded server audio
 ```
 
-该检查使用 5,000 首模拟歌曲，覆盖全部音乐、歌单、搜索、歌手及队列页面的重复数据读取；每项预热后连续刷新 8 次，总耗时预算为 100 毫秒。它用于捕捉重复排序、遍历等回退，不测量窗口渲染帧率。
+The library index stores file paths, metadata, thumbnail artwork, and playback state; it does not embed original audio. Access tokens are kept in Keychain. If the library index cannot be decoded, the app attempts to preserve a recovery copy before allowing a new library to be saved.
 
-不创建窗口的视图更新检查：
+A play is counted whenever a track successfully starts a new playback session. Resuming after pause and seeking do not add a play; selecting a track again, playing after stop, and looping do. Libraries created before play counts were introduced start at zero. Artist counts aggregate the tracks currently available in the library, grouping full artist tags while ignoring case and surrounding whitespace. Collaboration tags remain a single artist entry.
 
-```sh
-bash Scripts/test-rendering.sh
+Local playback works without a server. Enabling online mode sends catalog and audio requests to the configured server; importing local files does not upload them. The app has no telemetry or online lyrics feature.
+
+## Project layout
+
+```text
+Package.swift          Swift package manifest
+Sources/Sonora/        SwiftUI views, player model, import, persistence, and online client
+Resources/             App bundle metadata
+Scripts/               Build, icon generation, and test scripts
+Tests/SonoraTests/     Regression checks and the silent audio fixture
+VALIDATION.md          Historical validation notes
 ```
 
-6 组检查覆盖 5,000 行的视图值变化范围、内容和菜单更新、缩放布局边界、窗口尺寸约束切换顺序，以及封面后台缩略图、缓存替换和取消。该检查不构建窗口或测量实际重绘 / 帧率。
-
-mini 窗口尺寸和切换另有两项回归检查：
-
-```sh
-bash Scripts/test-mini-window.sh
-bash Scripts/test-mini-window-scene.sh
-```
-
-第二项使用透明、不可交互的独立测试窗口，需要可用的 macOS 窗口服务。两项均使用临时曲库，不播放声音。
-
-也可以直接用 Xcode 打开 `Package.swift` 进行开发。构建脚本不依赖完整 Xcode，且将编译缓存保存在项目内。
-
-## 数据位置
-
-曲库索引位于 `~/Library/Application Support/Sonora/library.json`。其中存储歌曲路径、标签、缩略封面、歌单与播放状态，不包含原始音乐。索引无法解析时，会先保留恢复副本，再允许创建新曲库。无远程请求、遥测或在线歌词功能。
-
-开发验证可通过环境变量 `SONORA_LIBRARY_PATH` 指定独立的曲库 JSON 路径，以免混入正常用户曲库。
+Recent improvements include isolated volume and selection updates, reusable track rows, background artwork decoding, cached page queries, background library saves, artist statistics, and a fixed-size mini player with playback-mode selection.
