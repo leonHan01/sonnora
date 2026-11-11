@@ -19,10 +19,11 @@ struct Sidebar: View {
             Text("音乐资料库").font(.system(size: 10, weight: .medium)).foregroundStyle(Theme.secondary)
                 .padding(.horizontal, 25).padding(.bottom, 8)
             VStack(spacing: 5) {
-                item("全部音乐", symbol: "square.stack.3d.up", section: .all, count: model.tracks.count)
+                item("全部音乐", symbol: "square.stack.3d.up", section: .all, count: model.availableTracks.count)
                 item("所有歌手", symbol: "person.2", section: .artists, count: model.artists.count)
                 item("最近添加", symbol: "clock", section: .recent)
                 item("我的收藏", symbol: "heart", section: .favorites, count: model.libraryStatistics.favoriteCount)
+                item("我的电台", symbol: "antenna.radiowaves.left.and.right", section: .radio)
             }.padding(.horizontal, 13)
 
             HStack {
@@ -55,8 +56,14 @@ struct Sidebar: View {
             Spacer(minLength: 15)
             VStack(alignment: .leading, spacing: 11) {
                 HStack(spacing: 7) {
-                    Circle().fill(Theme.accent).frame(width: 5, height: 5)
-                    Text("好音乐，一直在身边").font(.system(size: 10)).foregroundStyle(Theme.secondary)
+                    Circle().fill(model.isOnline ? Theme.accent : .orange).frame(width: 5, height: 5)
+                    Button { model.showConnectionSettings = true } label: {
+                        Text(model.isOnline ? "在线模式" : "离线模式").font(.system(size: 11))
+                        Image(systemName: "gearshape").font(.system(size: 10))
+                    }.buttonStyle(.plain).help(model.connectionMessage)
+                    Spacer()
+                    if model.isConnecting { ProgressView().controlSize(.mini) }
+                    else { IconButton(symbol: "arrow.clockwise", help: "重新连接 / 刷新曲库", size: 11, action: model.reconnect) }
                 }
                 Button(action: model.openFiles) {
                     HStack(spacing: 8) {
@@ -76,7 +83,8 @@ struct Sidebar: View {
     private func item(_ title: String, symbol: String, section: LibrarySection, count: Int? = nil) -> some View {
         let selected = model.section == section || (section == .artists && model.section.isArtistSection)
         return Button {
-            if section == .artists { model.showArtists() }
+            if section == .radio { model.showRadio() }
+            else if section == .artists { model.showArtists() }
             else {
                 model.section = section
                 model.selectedTrackID = nil

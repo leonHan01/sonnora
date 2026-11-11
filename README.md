@@ -17,6 +17,7 @@ No third-party dependencies. The application interface is currently in Simplifie
 - **Track information:** read embedded titles, artists, albums, artwork, and duration. Filenames are used when title tags are missing; tracks without artwork use a plain dark placeholder.
 - **Find the current track:** click **定位当前**, click the artwork or track information in the playback bar, or press `⌘J` to reveal and highlight the playing track.
 - **Online and offline listening:** browse server tracks, download on first playback, and keep listening to local and cached music when the server is unavailable.
+- **My Radio:** open **我的电台** in the sidebar to fetch and play one random server song. Skip with **换一首** or the player’s Next button; finishing a song fetches another. Offline radio selects local or cached songs.
 - **Native integration:** macOS Now Playing information and media commands, keyboard shortcuts, and saved library and playback state. Playback stays paused when the app is reopened.
 
 Supported file extensions: **MP3, M4A, AAC, WAV, AIF, AIFF, CAF, and FLAC**. Actual codec support depends on macOS decoding capabilities.
@@ -66,6 +67,7 @@ A compatible server is required; its backend is not included in this repository.
 | --- | --- |
 | `GET /api/music/tracks` | Return a JSON array of track metadata. |
 | `GET /api/music/tracks/{id}/audio` | Download a track’s audio file. |
+| `GET /api/music/tracks/radio?exclude=<UUID>` | Pick one playable server song, avoiding the previous song when another is available. Returns 204 for an empty radio. |
 | `/music.html` | Browser-based music management page. |
 
 Metadata fields are `id` (UUID), `title`, `artist`, `album`, `duration` (seconds), `extension`, `sha256`, `size` (bytes), and `uploadedAt` (ISO 8601). The client accepts supported lowercase extensions, lowercase SHA-256 digests, and files up to 128 MiB. API requests send `Authorization: Bearer <token>` when a token is configured. See [OnlineLibrary.swift](Sources/Sonora/OnlineLibrary.swift) for the client contract.
@@ -98,6 +100,8 @@ bash Scripts/build.sh
 ```
 
 The script builds a release executable for the current machine’s architecture, generates the app icon, creates `dist/声屿.app`, and applies and verifies an ad hoc signature. It does not launch the application.
+
+It also creates and verifies `dist/声屿-Sonora-<version>.dmg`, keeping only the latest Sonora DMG after successful packaging. To package an already-built app without rebuilding, run `bash Scripts/package-dmg.sh`.
 
 You can also select an architecture explicitly:
 

@@ -8,6 +8,7 @@ export SWIFTPM_MODULECACHE_OVERRIDE="$BUILD_ROOT/module-cache"
 swiftc -parse-as-library -swift-version 5 -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$BUILD_ROOT/module-cache" \
     "$PROJECT/Sources/Sonora/Models.swift" \
+    "$PROJECT/Sources/Sonora/OnlineLibrary.swift" \
     "$PROJECT/Sources/Sonora/TrackImporter.swift" \
     "$PROJECT/Sources/Sonora/Design.swift" \
     "$PROJECT/Sources/Sonora/PlayerModel.swift" \

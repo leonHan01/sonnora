@@ -17,6 +17,7 @@
 - **歌曲信息**：自动读取标题、歌手、专辑、封面和时长；缺少标题标签时使用文件名，无封面时显示深灰色占位块。
 - **定位当前歌曲**：点击「定位当前」、底部播放栏的封面或歌曲信息，或按 `⌘J`，即可滚动定位并高亮当前歌曲。
 - **在线与离线收听**：浏览服务器歌曲，首次播放时下载；服务器不可用时继续使用本地和已缓存音乐。
+- **我的电台**：点击侧栏「我的电台」，从服务器随机取一首歌播放。「换一首」和播放器的下一首按钮都能切歌，播完自动续播；有多首歌时避开上一首。离线时从本地及已缓存音乐中继续挑选，播放普通歌曲后退出电台。
 - **系统集成**：支持 macOS「正在播放」信息、媒体控制命令和键盘快捷键；保存曲库与播放状态，重新打开后保持暂停。
 
 支持的文件扩展名：**MP3、M4A、AAC、WAV、AIF、AIFF、CAF、FLAC**。实际编码支持以 macOS 解码能力为准。
@@ -66,6 +67,7 @@
 | --- | --- |
 | `GET /api/music/tracks` | 返回歌曲元数据的 JSON 数组。 |
 | `GET /api/music/tracks/{id}/audio` | 下载歌曲音频文件。 |
+| `GET /api/music/tracks/radio?exclude=<UUID>` | 随机获取一首可播放歌曲，尽量避开上一首；电台为空返回 204。 |
 | `/music.html` | 浏览器中的歌曲管理页面。 |
 
 元数据字段包括 `id`（UUID）、`title`、`artist`、`album`、`duration`（秒）、`extension`、`sha256`、`size`（字节）和 `uploadedAt`（ISO 8601）。客户端接受支持的小写扩展名、小写 SHA-256 摘要，以及不超过 128 MiB 的文件。配置令牌后，API 请求携带 `Authorization: Bearer <token>`。具体约定见 [OnlineLibrary.swift](Sources/Sonora/OnlineLibrary.swift)。
@@ -98,6 +100,8 @@ bash Scripts/build.sh
 ```
 
 脚本为当前机器架构编译发布版本，生成图标，将应用打包到 `dist/声屿.app`，并完成临时签名及签名校验。构建过程不会启动应用。
+
+同时生成并校验 `dist/声屿-Sonora-<版本号>.dmg`；新包成功后仅保留最新的声屿 DMG。已有应用无需重新编译，可直接运行 `bash Scripts/package-dmg.sh` 打包。
 
 也可以明确指定目标架构：
 

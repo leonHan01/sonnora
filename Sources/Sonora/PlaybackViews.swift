@@ -40,7 +40,7 @@ struct PlaybackBar: View {
                             .background(Theme.accent, in: Circle())
                     }.buttonStyle(.plain).help("播放 / 暂停（空格）")
                         .accessibilityLabel(model.isPlaying ? "暂停" : "播放")
-                        .disabled(model.tracks.isEmpty)
+                        .disabled(model.availableTracks.isEmpty && !model.isRadioActive)
                     IconButton(symbol: "forward.end.fill", help: "下一首（⌘→）", color: Theme.text, size: 16) { model.next() }
                     IconButton(symbol: "list.bullet", help: "播放队列", color: model.showQueue ? Theme.accent : Theme.secondary, size: 13) {
                         withAnimation(.easeInOut(duration: 0.18)) { model.showQueue.toggle() }
@@ -125,7 +125,7 @@ struct MiniPlayerView: View {
                 .buttonStyle(.plain)
                 .help("播放 / 暂停（空格）")
                 .accessibilityLabel(model.isPlaying ? "暂停" : "播放")
-                .disabled(model.tracks.isEmpty)
+                .disabled(model.availableTracks.isEmpty && !model.isRadioActive)
                 IconButton(symbol: "forward.end.fill", help: "下一首（⌘→）", color: Theme.text, size: 15) { model.next() }
                     .disabled(model.currentTrack == nil)
             }

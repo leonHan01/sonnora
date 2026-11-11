@@ -132,7 +132,7 @@ struct Playlist: Identifiable, Codable, Equatable, Sendable {
 }
 
 enum LibrarySection: Hashable {
-    case all, recent, favorites, artists, artist(String), playlist(UUID)
+    case all, recent, favorites, radio, artists, artist(String), playlist(UUID)
 
     var isArtistSection: Bool {
         switch self {

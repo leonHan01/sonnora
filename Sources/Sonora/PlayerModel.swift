@@ -91,6 +91,13 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private(set) var isConnecting = false
     @Published private(set) var connectionMessage = "离线模式 · 本地与已缓存音乐"
     @Published private(set) var loadingTrackID: UUID?
+    @Published private(set) var isRadioActive = false
+    @Published private(set) var isRadioLoading = false
+    @Published private(set) var radioTrackID: UUID?
+    @Published private(set) var radioMessage = "让电台为你挑一首，遇见下一段喜欢的旋律。"
+
+    private var radioTask: Task<Void, Never>?
+    private var radioAttempt = UUID()
 
     private let musicClient: OnlineMusicClient
     private var connectionToken = ""
@@ -218,6 +225,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         case .all: "全部音乐"
         case .recent: "最近添加"
         case .favorites: "我的收藏"
+        case .radio: "我的电台"
         case .artists: "所有歌手"
         case .artist(let id): artists.first { $0.id == id }?.name ?? "歌手"
         case .playlist(let id): playlists.first { $0.id == id }?.name ?? "歌单"
@@ -228,6 +236,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         case .all: "让喜欢的旋律，留在此刻。"
         case .recent: "新发现的声音，值得再听一遍。"
         case .favorites: "每一次心动，都有迹可循。"
+        case .radio: "一首接一首，把下一次心动交给电台。"
         case .artists: "从一个名字，听见更多喜欢。"
         case .artist: "这位歌手在你曲库中的全部歌曲。"
         case .playlist: "属于你的音乐片刻。"
@@ -243,7 +252,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         case .all: result = availableTracks
         case .recent: result = Array(availableTracks.sorted { $0.importedAt > $1.importedAt }.prefix(50))
         case .favorites: result = availableTracks.filter(\.isFavorite)
-        case .artists: result = []
+        case .artists, .radio: result = []
         case .artist(let id): result = artists.first { $0.id == id }?.tracks ?? []
         case .playlist(let id):
             let ids = playlists.first { $0.id == id }?.trackIDs ?? []
@@ -355,6 +364,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         let settings = OnlineSettings(enabled: enabled, server: url.absoluteString)
         try FileManager.default.createDirectory(at: connectionSettingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(settings).write(to: connectionSettingsURL, options: .atomic)
+        endRadio()
         onlineSettings = settings
         connectionToken = MusicCredentials.read(server: url)
         useOfflineMode(message: "离线模式 · 本地与已缓存音乐")
@@ -381,7 +391,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             defer { if connectionAttempt == attempt { isConnecting = false } }
             do {
                 let records = try await musicClient.list(server: server, token: token)
-                let incoming = try records.map { try $0.track(server: server, cacheRoot: musicCacheURL) }
+                let incoming = try records.map { try $0.track(server: server, cacheRoot: self.musicCacheURL) }
                 try Task.checkCancellation()
                 guard connectionAttempt == attempt else { return }
                 mergeOnlineTracks(incoming)
@@ -391,14 +401,16 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             } catch {
                 guard !Task.isCancelled, connectionAttempt == attempt else { return }
                 useOfflineMode(message: (error as? OnlineLibraryError)?.localizedDescription ?? "连接不上服务器，当前使用离线模式。")
+                if isRadioActive && currentTrack == nil && !isRadioLoading { playOfflineRadio() }
             }
         }
     }
 
     // Keep local edits and stable IDs across refreshes. Deleted server songs
     // remain available only when a playable local cache already exists.
-    func mergeOnlineTracks(_ incoming: [Track]) {
-        onlineIDs = Set(incoming.map(\.id))
+    func mergeOnlineTracks(_ incoming: [Track], replacingOnlineIDs: Bool = true) {
+        if replacingOnlineIDs { onlineIDs = Set(incoming.map(\.id)) }
+        else { onlineIDs.formUnion(incoming.map(\.id)) }
         var merged = tracks
         var positions = Dictionary(merged.enumerated().map { ($0.element.id, $0.offset) }, uniquingKeysWith: { first, _ in first })
         for var song in incoming {
@@ -442,6 +454,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         guard isOnline, onlineIDs.contains(track.id), track.remoteSource?.server.absoluteString == onlineSettings.server else {
             useOfflineMode(message: "连接不上服务器，当前使用离线模式。")
             showNotice("这首歌曲尚未缓存，请选择本地音乐或重新连接服务器。", error: true)
+            if isRadioActive { playOfflineRadio() }
             return
         }
         let attempt = UUID()
@@ -470,9 +483,104 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 try? FileManager.default.removeItem(at: track.url)
                 useOfflineMode(message: (error as? OnlineLibraryError)?.localizedDescription ?? "歌曲下载失败，当前使用离线模式。")
                 showNotice("无法下载《\(track.title)》，已切换到离线模式；本地和已缓存音乐仍可播放。", error: true)
-                if currentTrack != nil { loadCurrent(autoplay: true) }
+                if isRadioActive { playOfflineRadio() }
+                else if currentTrack != nil { loadCurrent(autoplay: true) }
             }
         }
+    }
+
+    var radioTrack: Track? { track(for: radioTrackID) }
+    var isRadioBuffering: Bool { isRadioLoading || (isRadioActive && loadingTrackID != nil) }
+
+    func showRadio() {
+        section = .radio
+        search = ""
+        selectedTrackID = nil
+        if !isRadioActive { nextRadioTrack() }
+    }
+
+    private func cancelRadioRequest() {
+        if isRadioLoading { radioMessage = "已取消加载，可以继续收听或换一首。" }
+        radioAttempt = UUID()
+        radioTask?.cancel()
+        radioTask = nil
+        isRadioLoading = false
+    }
+
+    private func endRadio() {
+        cancelRadioRequest()
+        isRadioActive = false
+    }
+
+    func nextRadioTrack() {
+        let wasActive = isRadioActive
+        cancelRadioRequest()
+        cancelAudioDownload()
+        let previousSource = radioTrack?.remoteSource
+        audioPlayer?.stop()
+        audioPlayer = nil
+        isPlaying = false
+        elapsed = 0
+        playbackDuration = 0
+        queue = PlaybackQueue()
+        isRadioActive = true
+        updateNowPlaying()
+        scheduleSave()
+        guard onlineSettings.enabled, isOnline || !wasActive,
+              let server = try? OnlineSettings.serverURL(onlineSettings.server) else {
+            playOfflineRadio()
+            return
+        }
+        let excluded = previousSource?.server == server ? previousSource?.id : nil
+        let attempt = UUID()
+        radioAttempt = attempt
+        isRadioLoading = true
+        radioMessage = "正在为你寻找下一首…"
+        let token = connectionToken
+        radioTask = Task { [weak self] in
+            guard let self else { return }
+            defer { if radioAttempt == attempt { isRadioLoading = false } }
+            do {
+                let record = try await musicClient.radio(server: server, token: token, excluding: excluded)
+                try Task.checkCancellation()
+                guard radioAttempt == attempt else { return }
+                guard let record else {
+                    isRadioActive = false
+                    radioMessage = "服务器还没有可播放的歌曲，请先在歌曲管理页上传音乐。"
+                    return
+                }
+                let song = try record.track(server: server, cacheRoot: musicCacheURL)
+                mergeOnlineTracks([song], replacingOnlineIDs: false)
+                isOnline = true
+                connectionMessage = "在线模式 · 电台收听中"
+                invalidateLibraryQueries()
+                radioTrackID = song.id
+                radioMessage = "来自你的在线曲库，听完自动为你换一首。"
+                queue = PlaybackQueue(ids: [song.id], startingAt: song.id)
+                selectedTrackID = song.id
+                loadCurrent(autoplay: true)
+            } catch {
+                guard !Task.isCancelled, radioAttempt == attempt else { return }
+                useOfflineMode(message: (error as? OnlineLibraryError)?.localizedDescription ?? "连接不上服务器，当前使用离线模式。")
+                playOfflineRadio()
+            }
+        }
+    }
+
+    private func playOfflineRadio() {
+        let local = availableTracks.filter { FileManager.default.fileExists(atPath: $0.url.path) }
+        let alternatives = local.filter { $0.id != radioTrackID }
+        guard let song = (alternatives.isEmpty ? local : alternatives).randomElement() else {
+            isRadioActive = false
+            radioMessage = "暂时无法收听电台。请连接服务器，或先导入本地音乐。"
+            return
+        }
+        isRadioActive = true
+        radioTrackID = song.id
+        radioMessage = "离线电台 · 从本地和已缓存音乐中为你挑选。"
+        queue = PlaybackQueue(ids: [song.id], startingAt: song.id)
+        selectedTrackID = song.id
+        loadCurrent(autoplay: true)
     }
 
     func openFiles() {
@@ -555,6 +663,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         guard let track = currentTrack else { return }
         isMiniMode = false
         search = ""
+        if isRadioActive { section = .radio; return }
         if !sectionTracks.contains(where: { $0.id == track.id }) { section = .all }
         selectedTrackID = track.id
         // A distinct request also scrolls again when the same song is already selected.
@@ -579,6 +688,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func playTrack(_ id: UUID, in source: [UUID]? = nil) {
+        endRadio()
         var ids = source ?? visibleTracks.map(\.id)
         if !ids.contains(id) { ids = [id] }
         if mode == .shuffle { ids = [id] + ids.filter { $0 != id }.shuffled() }
@@ -588,6 +698,8 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func playAll(shuffle: Bool = false) {
+        if section == .radio { nextRadioTrack(); return }
+        endRadio()
         var ids = visibleTracks.map(\.id)
         guard !ids.isEmpty else { return }
         if shuffle { mode = .shuffle; ids.shuffle() }
@@ -597,11 +709,13 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func togglePlayback() {
-        if isPlaying { pause() } else { resume() }
+        if isPlaying || isRadioBuffering || loadingTrackID != nil { pause() } else { resume() }
     }
 
     func resume() {
         guard !isPlaying else { return }
+        if isRadioLoading { return }
+        if isRadioActive && currentTrack == nil { nextRadioTrack(); return }
         guard loadingTrackID == nil else { return }
         guard currentTrack != nil else { playAll(); return }
         guard let audioPlayer else { loadCurrent(autoplay: true); return }
@@ -616,6 +730,8 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func pause() {
+        cancelRadioRequest()
+        if isRadioActive { radioMessage = "电台已暂停，随时继续收听。" }
         cancelAudioDownload()
         audioPlayer?.pause()
         isPlaying = false
@@ -625,6 +741,8 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func stop() {
+        cancelRadioRequest()
+        if isRadioActive { radioMessage = "电台已停止，可以继续收听或换一首。" }
         cancelAudioDownload()
         audioPlayer?.stop()
         audioPlayer?.currentTime = 0
@@ -636,6 +754,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func next(automatic: Bool = false) {
+        if isRadioActive { nextRadioTrack(); return }
         if queue.advance(mode: mode, automatic: automatic) { loadCurrent(autoplay: true) }
         else {
             if automatic { elapsed = playbackDuration }
@@ -647,6 +766,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func previous() {
+        if isRadioActive { seek(to: 0); return }
         if elapsed > 3 { seek(to: 0); return }
         if queue.retreat(mode: mode) { loadCurrent(autoplay: true) }
         else { seek(to: 0) }
@@ -730,6 +850,11 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             showNotice("无法开始播放，请检查音频输出设备。", error: true)
             return
         }
+        if isRadioActive {
+            radioMessage = isOnline && currentTrack?.remoteSource != nil
+                ? "来自你的在线曲库，听完自动为你换一首。"
+                : "离线电台 · 从本地和已缓存音乐中为你挑选。"
+        }
         guard !hasCountedCurrentPlayback, let id = queue.currentID,
               let index = position(of: id) else { return }
         tracks[index].playCount += 1
@@ -760,6 +885,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func enqueueNext(_ id: UUID) {
+        endRadio()
         let hadCurrent = queue.currentID != nil
         queue.insertNext(id)
         if !hadCurrent { loadCurrent(autoplay: false) }

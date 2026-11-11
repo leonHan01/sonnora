@@ -103,6 +103,15 @@ struct OnlineMusicClient: Sendable {
         return try JSONDecoder().decode([ServerTrack].self, from: data)
     }
 
+    func radio(server: URL, token: String, excluding id: UUID?) async throws -> ServerTrack? {
+        var parts = URLComponents(url: server.appendingPathComponent("api/music/tracks/radio"), resolvingAgainstBaseURL: false)!
+        if let id { parts.queryItems = [URLQueryItem(name: "exclude", value: id.uuidString.lowercased())] }
+        let (data, response) = try await session.data(for: request(parts.url!, token: token, timeout: 6))
+        if (response as? HTTPURLResponse)?.statusCode == 204 { return nil }
+        try check(response)
+        return try JSONDecoder().decode(ServerTrack.self, from: data)
+    }
+
     func download(_ track: Track, token: String) async throws {
         guard let source = track.remoteSource else { return }
         let url = source.server.appendingPathComponent("api/music/tracks/\(source.id.uuidString.lowercased())/audio")

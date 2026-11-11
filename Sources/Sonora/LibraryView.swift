@@ -24,8 +24,9 @@ struct LibraryPage: View, Equatable {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             topBar
-            if model.section == .artists { ArtistsView(model: model) }
-            else if model.tracks.isEmpty { welcome }
+            if model.section == .radio { RadioView(model: model) }
+            else if model.section == .artists { ArtistsView(model: model) }
+            else if model.availableTracks.isEmpty { welcome }
             else {
                 libraryHero
                 trackTable(showAlbum: showAlbum)
@@ -46,7 +47,7 @@ struct LibraryPage: View, Equatable {
                     .foregroundStyle(Theme.secondary)
             }.layoutPriority(-1).lineLimit(1)
             Spacer(minLength: 5)
-            HStack(spacing: 8) {
+            if model.section != .radio { HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").font(.system(size: 12)).foregroundStyle(Theme.secondary)
                 TextField(model.section == .artists ? "搜索歌手" : "搜索歌曲、艺术家、专辑", text: $model.search)
                     .textFieldStyle(.plain).font(.system(size: 11)).focused($searchFocused)
@@ -56,7 +57,7 @@ struct LibraryPage: View, Equatable {
                         .buttonStyle(.plain).accessibilityLabel("清空搜索")
                 } else { Text("⌘F").font(.system(size: 9)).foregroundStyle(Theme.secondary.opacity(0.65)) }
             }.padding(.horizontal, 12).padding(.vertical, 10)
-                .frame(width: 225).background(Theme.surface, in: RoundedRectangle(cornerRadius: 8))
+                .frame(width: 225).background(Theme.surface, in: RoundedRectangle(cornerRadius: 8)) }
             IconButton(symbol: "text.line.first.and.arrowtriangle.forward", help: model.showQueue ? "隐藏播放队列" : "显示播放队列", color: model.showQueue ? Theme.accent : Theme.secondary) {
                 withAnimation(.easeInOut(duration: 0.18)) { model.showQueue.toggle() }
             }
@@ -64,17 +65,23 @@ struct LibraryPage: View, Equatable {
         .padding(.horizontal, 30).padding(.top, 12).padding(.bottom, 12)
     }
 
+    private var connectionButton: some View {
+        Button("连接服务器 / 管理在线歌曲") { model.showConnectionSettings = true }
+            .buttonStyle(.plain).foregroundStyle(Theme.accent).font(.system(size: 12))
+    }
+
     private var welcome: some View {
         VStack(spacing: 0) {
             Spacer(minLength: 12)
             HStack(spacing: 24) {
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("离线聆听 · 自在拥有").font(.system(size: 10, weight: .medium)).tracking(2).foregroundStyle(Theme.accent)
+                    Text(model.isOnline ? "在线曲库 · 随处聆听" : "离线聆听 · 自在拥有").font(.system(size: 10, weight: .medium)).tracking(2).foregroundStyle(Theme.accent)
                     Text("每一首喜欢，\n都有一座岛。").font(.system(size: 37, weight: .semibold)).tracking(1).lineSpacing(6).fixedSize(horizontal: false, vertical: true)
                     Text("把你的音乐带进来。\n熟悉的旋律，随时为你响起。")
                         .font(.system(size: 12)).foregroundStyle(Theme.secondary).lineSpacing(7)
                     Button(action: model.openFiles) { Label("添加我的音乐", systemImage: "plus") }
                         .buttonStyle(AccentButtonStyle()).padding(.top, 4)
+                    connectionButton
                 }.frame(maxWidth: .infinity, alignment: .leading)
                 AmbientRecord(size: 180).padding(.trailing, 12)
             }.padding(.horizontal, 44)
@@ -185,6 +192,70 @@ struct LibraryPage: View, Equatable {
         if model.section == .favorites { return "点击歌曲旁的爱心，把喜欢留在这里。" }
         if case .artist = model.section { return "这位歌手的歌曲已移除，可返回所有歌手或导入音乐。" }
         return "在歌曲上点按右键，将它添加到这张歌单。"
+    }
+}
+
+struct RadioView: View {
+    @ObservedObject var model: PlayerModel
+
+    private var playbackLabel: String {
+        if model.isRadioBuffering { return "取消加载" }
+        if model.isRadioActive && model.isPlaying { return "暂停" }
+        if model.isRadioActive && model.currentTrack != nil { return "继续播放" }
+        return "开始收听"
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 26) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("YOUR PERSONAL RADIO").font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .tracking(2.2).foregroundStyle(Theme.accent)
+                    Text("我的电台").font(.system(size: 32, weight: .semibold))
+                    Text("一首接一首，把下一次心动交给电台。")
+                        .font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                }
+                HStack(alignment: .center, spacing: 30) {
+                    ArtworkView(track: model.radioTrack, size: 190, radius: 18)
+                    VStack(alignment: .leading, spacing: 13) {
+                        Label(model.isOnline ? "在线电台" : "离线电台", systemImage: "antenna.radiowaves.left.and.right")
+                            .font(.system(size: 11)).foregroundStyle(Theme.accent)
+                        Text(model.radioTrack?.title ?? "下一首，刚好喜欢")
+                            .font(.system(size: 23, weight: .semibold)).lineLimit(3)
+                        if let track = model.radioTrack {
+                            Text(track.artistName).font(.system(size: 14)).foregroundStyle(Theme.secondary)
+                            Text(track.album).font(.system(size: 11)).foregroundStyle(Theme.secondary).lineLimit(2)
+                            HStack(spacing: 10) {
+                                Button { model.toggleFavorite(track.id) } label: {
+                                    Label(track.isFavorite ? "已收藏" : "收藏", systemImage: track.isFavorite ? "heart.fill" : "heart")
+                                }.buttonStyle(.plain).foregroundStyle(Theme.accent).font(.system(size: 12))
+                                PlaylistAddMenu(model: model, track: track)
+                            }
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }.padding(26).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Theme.surface, in: RoundedRectangle(cornerRadius: 20))
+                HStack(spacing: 14) {
+                    Button {
+                        if model.isRadioActive { model.togglePlayback() }
+                        else { model.nextRadioTrack() }
+                    } label: {
+                        Label(playbackLabel, systemImage: model.isRadioBuffering ? "xmark" : (model.isRadioActive && model.isPlaying ? "pause.fill" : "play.fill"))
+                    }.buttonStyle(AccentButtonStyle())
+                    Button { model.nextRadioTrack() } label: { Label("换一首", systemImage: "forward.end.fill") }
+                        .buttonStyle(QuietButtonStyle())
+                    if model.isRadioBuffering { ProgressView().controlSize(.small) }
+                    Spacer()
+                }
+                Text(model.isRadioActive && model.loadingTrackID != nil ? "正在缓存歌曲，完成后开始播放…" : model.radioMessage)
+                    .font(.system(size: 12)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("电台状态")
+                if !model.isOnline {
+                    Button("服务器连接设置") { model.showConnectionSettings = true }
+                        .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(Theme.accent)
+                }
+            }.padding(30).frame(maxWidth: 850, alignment: .leading).frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 
@@ -312,6 +383,7 @@ struct TrackRow: View, Equatable {
         if playlistID != nil { Button("从此歌单移除") { model.removeFromCurrentPlaylist(track.id) } }
         Divider()
         Button("在 Finder 中显示", systemImage: "folder") { model.reveal(track) }
+            .disabled(track.remoteSource != nil && !FileManager.default.fileExists(atPath: track.url.path))
         Button("从曲库移除（保留文件）", role: .destructive) { model.removeFromLibrary(track.id) }
     }
 

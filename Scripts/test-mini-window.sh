@@ -12,6 +12,7 @@ sed '/^@main$/d' "$PROJECT/Sources/Sonora/SonoraApp.swift" > "$TEST_ROOT/SonoraA
 swiftc -parse-as-library -swift-version 5 -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$BUILD_ROOT/module-cache" \
     "$PROJECT/Sources/Sonora/Models.swift" \
+    "$PROJECT/Sources/Sonora/OnlineLibrary.swift" \
     "$PROJECT/Sources/Sonora/TrackImporter.swift" \
     "$PROJECT/Sources/Sonora/Design.swift" \
     "$PROJECT/Sources/Sonora/PlayerModel.swift" \
@@ -19,6 +20,7 @@ swiftc -parse-as-library -swift-version 5 -target "$(uname -m)-apple-macosx14.0"
     "$PROJECT/Sources/Sonora/LibraryView.swift" \
     "$PROJECT/Sources/Sonora/ArtistsView.swift" \
     "$PROJECT/Sources/Sonora/Sidebar.swift" \
+    "$PROJECT/Sources/Sonora/ConnectionSettingsView.swift" \
     "$PROJECT/Sources/Sonora/PlaybackViews.swift" \
     "$PROJECT/Sources/Sonora/PlayerWindowPresentation.swift" \
     "$TEST_ROOT/SonoraAppForTest.swift" \

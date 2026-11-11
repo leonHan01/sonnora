@@ -24,6 +24,9 @@ struct SonoraApp: App {
         }
         .sonoraWindowConfiguration()
         .commands {
+            CommandGroup(after: .appSettings) {
+                Button("服务器连接…") { model.showConnectionSettings = true }
+            }
             CommandGroup(replacing: .newItem) {
                 Button("导入音乐…", action: model.openFiles).keyboardShortcut("o", modifiers: .command)
                 Button("新建歌单…") {
@@ -61,9 +64,9 @@ struct SonoraApp: App {
                 Button("关于声屿") {
                     NSApp.orderFrontStandardAboutPanel(options: [
                         .applicationName: "声屿 · Sonora",
-                        .applicationVersion: "1.1.7",
-                        .version: "18",
-                        .credits: NSAttributedString(string: "每一首喜欢，都有一座岛。\n原生 macOS 本地音乐播放器")
+                        .applicationVersion: "1.3.0",
+                        .version: "20",
+                        .credits: NSAttributedString(string: "每一首喜欢，都有一座岛。\n原生 macOS 在线与离线音乐播放器")
                     ])
                 }
             }
@@ -88,7 +91,9 @@ struct RootView: View {
         .background(Theme.background).foregroundStyle(Theme.text).tint(Theme.accent)
         .preferredColorScheme(.dark)
         .onReceive(timer) { _ in model.tick() }
+        .task { model.startOnlineMode() }
         .sheet(item: $model.playlistEditor) { editor in PlaylistEditorView(model: model, editor: editor) }
+        .sheet(isPresented: $model.showConnectionSettings) { ConnectionSettingsView(model: model) }
     }
 
     private var fullPlayer: some View {
@@ -97,6 +102,14 @@ struct RootView: View {
                 Sidebar(model: model)
                 VStack(spacing: 0) {
                     LibraryView(model: model)
+                    if let id = model.loadingTrackID, let track = model.track(for: id) {
+                        HStack(spacing: 9) {
+                            ProgressView().controlSize(.small)
+                            Text("正在缓存《\(track.title)》，下载后开始播放…").font(.system(size: 11))
+                            Spacer()
+                            Button("取消", action: model.pause).buttonStyle(.plain)
+                        }.foregroundStyle(Theme.accent).padding(.horizontal, 22).padding(.vertical, 10).background(Theme.surface)
+                    }
                     if model.isImporting {
                         HStack(spacing: 9) {
                             ProgressView().controlSize(.small).scaleEffect(0.7)
