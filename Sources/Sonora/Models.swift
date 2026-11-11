@@ -11,6 +11,7 @@ struct Track: Identifiable, Codable, Equatable, Sendable {
     var isFavorite = false
     var artworkData: Data?
     var playCount = 0
+    var remoteSource: RemoteTrackSource?
 
     var searchText: String { "\(title) \(artist) \(album) \(url.lastPathComponent)" }
     var fileExtension: String { url.pathExtension.uppercased() }
@@ -21,7 +22,7 @@ struct Track: Identifiable, Codable, Equatable, Sendable {
     var artistID: String { artistName.lowercased() }
 
     enum CodingKeys: String, CodingKey {
-        case id, url, title, artist, album, duration, importedAt, isFavorite, artworkData, playCount
+        case id, url, title, artist, album, duration, importedAt, isFavorite, artworkData, playCount, remoteSource
     }
 }
 
@@ -39,6 +40,7 @@ extension Track {
         isFavorite = try values.decode(Bool.self, forKey: .isFavorite)
         artworkData = try values.decodeIfPresent(Data.self, forKey: .artworkData)
         playCount = max(0, try values.decodeIfPresent(Int.self, forKey: .playCount) ?? 0)
+        remoteSource = try values.decodeIfPresent(RemoteTrackSource.self, forKey: .remoteSource)
     }
 }
 
