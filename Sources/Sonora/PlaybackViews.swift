@@ -1,5 +1,41 @@
 import SwiftUI
 
+// Only these small views observe download ticks; the library and its menus do
+// not need to redraw for every chunk of the current song.
+struct CurrentDownloadStatus: View {
+    @ObservedObject var progress: PlaybackDownloadProgress
+
+    var body: some View {
+        if let active = progress.active {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 12) {
+                    Text(active.progress.status)
+                    Spacer(minLength: 0)
+                    Text("\(active.progress.percentage)%").monospacedDigit()
+                    Text(active.progress.byteDescription).foregroundStyle(Theme.secondary).monospacedDigit()
+                }.font(.system(size: 11)).lineLimit(1)
+                ProgressView(value: active.progress.fraction).progressViewStyle(.linear).tint(Theme.accent)
+            }
+            .foregroundStyle(Theme.accent)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("当前歌曲下载进度")
+            .accessibilityValue("\(active.progress.status)，\(active.progress.percentage)%，\(active.progress.byteDescription)")
+        }
+    }
+}
+
+struct CurrentDownloadCaption: View {
+    @ObservedObject var progress: PlaybackDownloadProgress
+
+    var body: some View {
+        if let active = progress.active {
+            Text("\(active.progress.status) · \(active.progress.percentage)%")
+                .font(.system(size: 10)).monospacedDigit().foregroundStyle(Theme.accent).lineLimit(1)
+                .help(active.progress.byteDescription)
+        }
+    }
+}
+
 struct PlaybackBar: View {
     @ObservedObject var model: PlayerModel
 
@@ -11,7 +47,11 @@ struct PlaybackBar: View {
                         ArtworkView(track: model.currentTrack, size: 52, radius: 9)
                         VStack(alignment: .leading, spacing: 7) {
                             Text(model.currentTrack?.title ?? "音乐，等待响起").font(.system(size: 12, weight: .medium)).lineLimit(1)
-                            Text(model.currentTrack?.artist ?? "导入一首你喜欢的歌").font(.system(size: 10)).foregroundStyle(Theme.secondary).lineLimit(1)
+                            if model.loadingTrackID != nil {
+                                CurrentDownloadCaption(progress: model.downloadProgress)
+                            } else {
+                                Text(model.currentTrack?.artist ?? "导入一首你喜欢的歌").font(.system(size: 10)).foregroundStyle(Theme.secondary).lineLimit(1)
+                            }
                         }
                         Spacer(minLength: 0)
                     }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
@@ -96,11 +136,15 @@ struct MiniPlayerView: View {
                         .foregroundStyle(Theme.text)
                         .lineLimit(1)
                         .help(model.currentTrack?.title ?? "尚未播放")
-                    Text(model.currentTrack?.artist ?? "导入一首你喜欢的歌")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Theme.secondary)
-                        .lineLimit(1)
-                        .help(model.currentTrack?.artist ?? "")
+                    if model.loadingTrackID != nil {
+                        CurrentDownloadCaption(progress: model.downloadProgress)
+                    } else {
+                        Text(model.currentTrack?.artist ?? "导入一首你喜欢的歌")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.secondary)
+                            .lineLimit(1)
+                            .help(model.currentTrack?.artist ?? "")
+                    }
                     if let track = model.currentTrack, !track.album.isEmpty {
                         Text(track.album)
                             .font(.system(size: 10))

@@ -64,8 +64,8 @@ struct SonoraApp: App {
                 Button("关于声屿") {
                     NSApp.orderFrontStandardAboutPanel(options: [
                         .applicationName: "声屿 · Sonora",
-                        .applicationVersion: "1.3.0",
-                        .version: "20",
+                        .applicationVersion: "1.6.0",
+                        .version: "27",
                         .credits: NSAttributedString(string: "每一首喜欢，都有一座岛。\n原生 macOS 在线与离线音乐播放器")
                     ])
                 }
@@ -94,6 +94,18 @@ struct RootView: View {
         .task { model.startOnlineMode() }
         .sheet(item: $model.playlistEditor) { editor in PlaylistEditorView(model: model, editor: editor) }
         .sheet(isPresented: $model.showConnectionSettings) { ConnectionSettingsView(model: model) }
+        .confirmationDialog("删除歌曲", isPresented: Binding(get: { model.deletionTrack != nil }, set: { if !$0 { model.deletionTrack = nil } }), presenting: model.deletionTrack) { track in
+            if track.remoteSource == nil {
+                Button("将本地文件移到废纸篓", role: .destructive) { Task { await model.deleteTrack(track.id, fromCloud: false, localFile: true) } }
+                Button("仅从本地曲库移除（保留文件）") { model.removeFromLibrary(track.id) }
+            }
+            if track.hasCloudCopy {
+                Button("删除云端歌曲及本机缓存", role: .destructive) { Task { await model.deleteTrack(track.id, fromCloud: true, localFile: false) } }
+            }
+            Button("取消", role: .cancel) {}
+        } message: { track in
+            Text("《\(track.title)》：删除云端副本会影响所有在线歌单，其他设备重新连接后同步清理缓存。本地原文件可移到废纸篓恢复。")
+        }
     }
 
     private var fullPlayer: some View {
@@ -104,11 +116,17 @@ struct RootView: View {
                     LibraryView(model: model)
                     if let id = model.loadingTrackID, let track = model.track(for: id) {
                         HStack(spacing: 9) {
-                            ProgressView().controlSize(.small)
-                            Text("正在缓存《\(track.title)》，下载后开始播放…").font(.system(size: 11))
-                            Spacer()
+                            Image(systemName: "arrow.down.circle").font(.system(size: 19, weight: .light))
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text("正在缓存《\(track.title)》").font(.system(size: 11)).lineLimit(1).help(track.title)
+                                CurrentDownloadStatus(progress: model.downloadProgress)
+                            }.frame(maxWidth: .infinity, alignment: .leading)
                             Button("取消", action: model.pause).buttonStyle(.plain)
                         }.foregroundStyle(Theme.accent).padding(.horizontal, 22).padding(.vertical, 10).background(Theme.surface)
+                    }
+                    if model.isManagingStorage {
+                        HStack { ProgressView().controlSize(.small); Text(model.storageMessage).font(.system(size: 11)); Spacer() }
+                            .padding(12).foregroundStyle(Theme.accent).background(Theme.surface)
                     }
                     if model.isImporting {
                         HStack(spacing: 9) {

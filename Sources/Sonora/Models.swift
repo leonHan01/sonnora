@@ -12,6 +12,15 @@ struct Track: Identifiable, Codable, Equatable, Sendable {
     var artworkData: Data?
     var playCount = 0
     var remoteSource: RemoteTrackSource?
+    // Uploaded originals keep their local identity, file, favorites and playlist references.
+    var cloudSources: [RemoteTrackSource] = []
+
+    func source(on server: URL) -> RemoteTrackSource? {
+        if remoteSource?.server == server { return remoteSource }
+        return cloudSources.first { $0.server == server }
+    }
+    var hasLocalCopy: Bool { FileManager.default.fileExists(atPath: url.path) }
+    var hasCloudCopy: Bool { remoteSource != nil || !cloudSources.isEmpty }
 
     var searchText: String { "\(title) \(artist) \(album) \(url.lastPathComponent)" }
     var fileExtension: String { url.pathExtension.uppercased() }
@@ -22,7 +31,7 @@ struct Track: Identifiable, Codable, Equatable, Sendable {
     var artistID: String { artistName.lowercased() }
 
     enum CodingKeys: String, CodingKey {
-        case id, url, title, artist, album, duration, importedAt, isFavorite, artworkData, playCount, remoteSource
+        case id, url, title, artist, album, duration, importedAt, isFavorite, artworkData, playCount, remoteSource, cloudSources
     }
 }
 
@@ -41,6 +50,7 @@ extension Track {
         artworkData = try values.decodeIfPresent(Data.self, forKey: .artworkData)
         playCount = max(0, try values.decodeIfPresent(Int.self, forKey: .playCount) ?? 0)
         remoteSource = try values.decodeIfPresent(RemoteTrackSource.self, forKey: .remoteSource)
+        cloudSources = try values.decodeIfPresent([RemoteTrackSource].self, forKey: .cloudSources) ?? []
     }
 }
 
@@ -132,7 +142,7 @@ struct Playlist: Identifiable, Codable, Equatable, Sendable {
 }
 
 enum LibrarySection: Hashable {
-    case all, recent, favorites, radio, artists, artist(String), playlist(UUID)
+    case all, recent, favorites, radio, artists, artist(String), playlists, onlinePlaylists, playlist(UUID), onlinePlaylist(UUID)
 
     var isArtistSection: Bool {
         switch self {
@@ -140,6 +150,23 @@ enum LibrarySection: Hashable {
         default: false
         }
     }
+
+    var isOnlinePlaylistNavigation: Bool {
+        switch self { case .onlinePlaylists, .onlinePlaylist: true; default: false }
+    }
+    var isLocalPlaylistNavigation: Bool {
+        switch self { case .playlists, .playlist: true; default: false }
+    }
+    var isPlaylistDetail: Bool {
+        switch self { case .playlist, .onlinePlaylist: true; default: false }
+    }
+}
+
+struct PlaylistSummary: Identifiable {
+    let id: UUID
+    let name: String
+    let trackCount: Int
+    let artworkTrack: Track?
 }
 
 struct TrackRevealRequest: Equatable, Sendable {
@@ -187,6 +214,13 @@ enum PlaybackMode: String, CaseIterable, Codable, Sendable {
 /// A queue contains unique library IDs. The cursor always points at a valid item, or is nil.
 struct PlaybackQueue: Codable, Equatable, Sendable {
     private(set) var ids: [UUID] = []
+
+    mutating func replace(_ old: UUID, with new: UUID) {
+        let current = currentID == old ? new : currentID
+        var seen = Set<UUID>()
+        ids = ids.map { $0 == old ? new : $0 }.filter { seen.insert($0).inserted }
+        index = current.flatMap { ids.firstIndex(of: $0) }
+    }
     private(set) var index: Int?
     var currentID: UUID? {
         guard let index, ids.indices.contains(index) else { return nil }
@@ -269,6 +303,19 @@ struct PlaybackQueue: Codable, Equatable, Sendable {
         ids = Array(ids.prefix(index + 1))
     }
 
+    func upcomingIDs(mode: PlaybackMode, limit: Int = 3) -> [UUID] {
+        guard let currentID, limit > 0 else { return [] }
+        var preview = self
+        var seen: Set<UUID> = [currentID]
+        var result: [UUID] = []
+        // Also prepare manual skips while repeat-one is selected.
+        while result.count < limit, preview.advance(mode: mode, automatic: false),
+              let id = preview.currentID, seen.insert(id).inserted {
+            result.append(id)
+        }
+        return result
+    }
+
     func validated(against validIDs: Set<UUID>) -> PlaybackQueue {
         PlaybackQueue(ids: ids.filter { validIDs.contains($0) }, startingAt: currentID)
     }
@@ -282,6 +329,7 @@ struct LibrarySnapshot: Codable, Equatable, Sendable {
     var mode = PlaybackMode.loopAll
     var volume: Float = 0.7
     var elapsed: Double = 0
+    var onlinePlaylists: [String: [ServerPlaylist]] = [:]
 
     func sanitized() -> LibrarySnapshot {
         var copy = self
@@ -298,6 +346,22 @@ struct LibrarySnapshot: Codable, Equatable, Sendable {
         copy.volume = volume.isFinite ? min(1, max(0, volume)) : 0.7
         copy.elapsed = elapsed.isFinite ? max(0, elapsed) : 0
         return copy
+    }
+}
+
+
+extension LibrarySnapshot {
+    enum CodingKeys: String, CodingKey { case version, tracks, playlists, queue, mode, volume, elapsed, onlinePlaylists }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        version = try values.decode(Int.self, forKey: .version)
+        tracks = try values.decode([Track].self, forKey: .tracks)
+        playlists = try values.decode([Playlist].self, forKey: .playlists)
+        queue = try values.decode(PlaybackQueue.self, forKey: .queue)
+        mode = try values.decode(PlaybackMode.self, forKey: .mode)
+        volume = try values.decode(Float.self, forKey: .volume)
+        elapsed = try values.decode(Double.self, forKey: .elapsed)
+        onlinePlaylists = try values.decodeIfPresent([String: [ServerPlaylist]].self, forKey: .onlinePlaylists) ?? [:]
     }
 }
 

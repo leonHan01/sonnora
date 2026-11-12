@@ -1,0 +1,7 @@
+<resources>
+    <string name="music_summary">%1$d 首音乐 · %2$d 首可离线播放</string>
+    <string name="connection_refreshing">连接中 · %1$s</string>
+    <string name="playlist_summary">%1$d 首可播放 · 共 %2$d 首</string>
+    <string name="song_cached">%1$s · 已缓存</string>
+    <string name="song_play_count">%1$s · %2$d 次</string>
+</resources>

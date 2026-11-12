@@ -26,32 +26,12 @@ struct Sidebar: View {
                 item("我的电台", symbol: "antenna.radiowaves.left.and.right", section: .radio)
             }.padding(.horizontal, 13)
 
-            HStack {
-                Text("我的歌单").font(.system(size: 10, weight: .medium)).foregroundStyle(Theme.secondary)
-                Spacer()
-                IconButton(symbol: "plus", help: "新建歌单", size: 11) { model.playlistEditor = .create }
-            }.padding(.leading, 25).padding(.trailing, 15).padding(.top, 14).padding(.bottom, 4)
-
-            ScrollView {
-                LazyVStack(spacing: 5) {
-                    if model.playlists.isEmpty {
-                        Button { model.playlistEditor = .create } label: {
-                            HStack(spacing: 9) {
-                                Image(systemName: "plus.square.dashed").font(.system(size: 15))
-                                Text("创建第一张歌单").font(.system(size: 11))
-                                Spacer()
-                            }.foregroundStyle(Theme.secondary.opacity(0.75)).padding(.horizontal, 12).padding(.vertical, 12)
-                        }.buttonStyle(.plain)
-                    }
-                    ForEach(model.playlists) { playlist in
-                        item(playlist.name, symbol: "music.note.list", section: .playlist(playlist.id), count: playlist.trackIDs.count)
-                            .contextMenu {
-                                Button("重命名歌单") { model.playlistEditor = .rename(playlist.id) }
-                                Button("删除歌单", role: .destructive) { model.deletePlaylist(playlist.id) }
-                            }
-                    }
-                }.padding(.horizontal, 13)
-            }
+            Text("歌单").font(.system(size: 10, weight: .medium)).foregroundStyle(Theme.secondary)
+                .padding(.horizontal, 25).padding(.top, 18).padding(.bottom, 8)
+            VStack(spacing: 5) {
+                item("在线歌单", symbol: "cloud", section: .onlinePlaylists, count: model.onlinePlaylists.count)
+                item("我的歌单", symbol: "music.note.list", section: .playlists, count: model.playlists.count)
+            }.padding(.horizontal, 13)
 
             Spacer(minLength: 15)
             VStack(alignment: .leading, spacing: 11) {
@@ -82,9 +62,13 @@ struct Sidebar: View {
 
     private func item(_ title: String, symbol: String, section: LibrarySection, count: Int? = nil) -> some View {
         let selected = model.section == section || (section == .artists && model.section.isArtistSection)
+            || (section == .onlinePlaylists && model.section.isOnlinePlaylistNavigation)
+            || (section == .playlists && model.section.isLocalPlaylistNavigation)
         return Button {
             if section == .radio { model.showRadio() }
             else if section == .artists { model.showArtists() }
+            else if section == .onlinePlaylists { model.showPlaylists(online: true) }
+            else if section == .playlists { model.showPlaylists(online: false) }
             else {
                 model.section = section
                 model.selectedTrackID = nil

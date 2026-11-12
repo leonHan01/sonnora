@@ -6,6 +6,8 @@ import ImageIO
 typealias LocalState<Value> = SwiftUI.State<Value>
 
 struct ArtworkRequest: Equatable, Sendable {
+    // The radio's large cover needs Retina pixels; small list rows stay small.
+    static let maximumPixelSize = 1_024
     let trackID: UUID
     let data: Data
     let pixelSize: Int
@@ -14,7 +16,7 @@ struct ArtworkRequest: Equatable, Sendable {
         guard let track, let data = track.artworkData else { return nil }
         trackID = track.id
         self.data = data
-        self.pixelSize = max(1, min(400, pixelSize))
+        self.pixelSize = max(1, min(Self.maximumPixelSize, pixelSize))
     }
 
     var cacheKey: NSString { "\(trackID.uuidString)-\(pixelSize)" as NSString }
@@ -32,7 +34,7 @@ private actor ArtworkDecoder {
         let width = (properties?[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue ?? 1
         let height = (properties?[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue ?? 1
         // Keep enough pixels for scaledToFill, including nonsquare cover art.
-        let maximum = min(400, ceil(Double(request.pixelSize) * max(width, height) / max(1, min(width, height))))
+        let maximum = min(Double(ArtworkRequest.maximumPixelSize), ceil(Double(request.pixelSize) * max(width, height) / max(1, min(width, height))))
         return CGImageSourceCreateThumbnailAtIndex(source, 0, [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceThumbnailMaxPixelSize: Int(maximum),
@@ -86,6 +88,8 @@ enum ArtworkCache {
         cache.countLimit = 150
         return cache
     }()
+    static func clear() { thumbnails.removeAllObjects(); cache.removeAllObjects() }
+
     static func image(for track: Track?) -> NSImage? {
         guard let track, let data = track.artworkData else { return nil }
         let key = track.id as NSUUID

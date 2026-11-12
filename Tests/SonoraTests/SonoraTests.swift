@@ -878,10 +878,36 @@ final class PageDataTests {
         expect(model.sectionTracks.map(\.id) == [tracks[2].id, tracks[1].id])
         expect(model.sectionStatistics.duration == 50)
         model.deletePlaylist(list.id)
-        expect(model.section == .all)
-        expect(model.visibleTracks.count == 3)
+        expect(model.section == .playlists)
+        expect(model.visibleTracks.isEmpty && model.availableTracks.count == 3)
         model.section = .playlist(list.id)
         expect(model.visibleTracks.isEmpty)
+    }
+
+    func testPlaylistCollectionsNavigateSearchAndKeepPlayback() {
+        let (model, tracks) = fixture()
+        let list = Playlist(name: "Night walk", trackIDs: [tracks[1].id, tracks[0].id]), empty = Playlist(name: "Empty")
+        model.playlists = [list, empty]
+        model.queue = PlaybackQueue(ids: tracks.map(\.id), startingAt: tracks[1].id)
+        model.elapsed = 42
+        let queue = model.queue
+        model.search = "old query"
+        model.showPlaylists(online: false)
+        expect(model.section == .playlists && model.sectionTitle == "我的歌单" && model.search.isEmpty)
+        expect(model.sectionTracks.isEmpty && model.playlistSummaries(online: false).map(\.trackCount) == [2, 0])
+        model.search = "night"
+        expect(model.playlistSummaries(online: false).map(\.id) == [list.id])
+        model.showPlaylist(list.id, online: false)
+        expect(model.section == .playlist(list.id) && model.search.isEmpty && model.section.isLocalPlaylistNavigation)
+        expect(model.visibleTracks.map(\.id) == list.trackIDs && model.queue == queue && model.elapsed == 42)
+        model.showPlaylists(online: false)
+        expect(model.playlistSummaries(online: false).count == 2 && model.queue == queue)
+        model.showPlaylist(empty.id, online: false)
+        expect(model.section.isPlaylistDetail && model.sectionTracks.isEmpty)
+        model.deletePlaylist(empty.id)
+        expect(model.section == .playlists && model.playlistSummaries(online: false).count == 1)
+        model.showPlaylist(UUID(), online: false)
+        expect(model.section == .playlists && model.queue == queue)
     }
 
     func testCachedArtistSortsAndQueueRespondToChanges() {
@@ -1030,6 +1056,7 @@ struct SonoraTestRunner {
         await run("testCachedPagesRefreshAfterFavoriteMetadataPlayCountAndRemoval") { PageDataTests().testCachedPagesRefreshAfterFavoriteMetadataPlayCountAndRemoval() }
         await run("testCachedSearchAndSortPreserveMatchingAndPageOrder") { PageDataTests().testCachedSearchAndSortPreserveMatchingAndPageOrder() }
         await run("testCachedPlaylistReflectsReorderAdditionRenameAndDeletion") { PageDataTests().testCachedPlaylistReflectsReorderAdditionRenameAndDeletion() }
+        await run("testPlaylistCollectionsNavigateSearchAndKeepPlayback") { PageDataTests().testPlaylistCollectionsNavigateSearchAndKeepPlayback() }
         await run("testCachedArtistSortsAndQueueRespondToChanges") { PageDataTests().testCachedArtistSortsAndQueueRespondToChanges() }
         await run("testNumberedRowsRetainIdentityAfterFilteringAndReordering") { PageDataTests().testNumberedRowsRetainIdentityAfterFilteringAndReordering() }
         await run("testAutosaveRunsOffMainActorAndFinalFlushKeepsNewestState") { try await PageDataTests().testAutosaveRunsOffMainActorAndFinalFlushKeepsNewestState() }

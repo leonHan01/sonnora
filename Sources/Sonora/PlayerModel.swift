@@ -26,6 +26,29 @@ final class PlaybackProgress: ObservableObject {
 }
 
 @MainActor
+final class PlaybackDownloadProgress: ObservableObject {
+    struct Active: Equatable {
+        let trackID: UUID
+        var progress: TrackDownloadProgress
+    }
+    @Published private(set) var active: Active?
+
+    func begin(_ track: Track) {
+        active = Active(trackID: track.id, progress: TrackDownloadProgress(receivedBytes: 0, totalBytes: track.remoteSource?.size ?? 0))
+    }
+
+    func update(_ progress: TrackDownloadProgress, for id: UUID) {
+        guard let active, active.trackID == id,
+              progress.receivedBytes >= active.progress.receivedBytes,
+              progress.phase.rawValue >= active.progress.phase.rawValue else { return }
+        let next = Active(trackID: id, progress: progress)
+        if next != active { self.active = next }
+    }
+
+    func reset() { if active != nil { active = nil } }
+}
+
+@MainActor
 final class PlaybackVolume: ObservableObject {
     @Published fileprivate(set) var value: Float = 0.7
 }
@@ -46,6 +69,14 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             trackQueryCache.removeAll()
         }
     }
+    @Published private(set) var onlinePlaylistCache: [String: [ServerPlaylist]] = [:] {
+        didSet { sectionCache.removeAll(); trackQueryCache.removeAll() }
+    }
+    @Published private(set) var onlinePlaylistMessage = ""
+    private var configuredServer: URL { (try? OnlineSettings.serverURL(onlineSettings.server)) ?? URL(string: "https://invalid.invalid")! }
+    var onlinePlaylists: [ServerPlaylist] { onlinePlaylistCache[onlineSettings.server] ?? [] }
+    var isOnlinePlaylistSection: Bool { if case .onlinePlaylist = section { return true }; return false }
+
     @Published var section = LibrarySection.all
     @Published var search = ""
     @Published var sort = TrackSort.added
@@ -58,10 +89,14 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
     @Published private(set) var trackRevealRequest: TrackRevealRequest?
     @Published var queue = PlaybackQueue() {
-        didSet { queuedTrackCache = nil }
+        didSet { queuedTrackCache = nil; refreshUpcomingCache() }
     }
-    @Published var mode = PlaybackMode.loopAll
-    @Published var isPlaying = false
+    @Published var mode = PlaybackMode.loopAll {
+        didSet { if mode != oldValue { refreshUpcomingCache() } }
+    }
+    @Published var isPlaying = false {
+        didSet { if isPlaying != oldValue { refreshUpcomingCache() } }
+    }
     let playbackProgress = PlaybackProgress()
     var elapsed: Double {
         get { playbackProgress.elapsed }
@@ -85,12 +120,16 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var importProgress = ""
     @Published var notice: PlayerNotice?
     @Published var playlistEditor: PlaylistEditor?
+    @Published var deletionTrack: Track?
+    @Published private(set) var isManagingStorage = false
+    @Published private(set) var storageMessage = ""
     @Published var showConnectionSettings = false
     @Published private(set) var onlineSettings = OnlineSettings()
     @Published private(set) var isOnline = false
     @Published private(set) var isConnecting = false
     @Published private(set) var connectionMessage = "离线模式 · 本地与已缓存音乐"
     @Published private(set) var loadingTrackID: UUID?
+    let downloadProgress = PlaybackDownloadProgress()
     @Published private(set) var isRadioActive = false
     @Published private(set) var isRadioLoading = false
     @Published private(set) var radioTrackID: UUID?
@@ -98,6 +137,17 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private var radioTask: Task<Void, Never>?
     private var radioAttempt = UUID()
+    private(set) var radioUpcomingIDs: [UUID] = []
+    private var upcomingCacheTask: Task<Void, Never>?
+    private var upcomingCacheAttempt = UUID()
+    private struct UpcomingCachePlan: Equatable {
+        let currentID: UUID
+        let queuedIDs: [UUID]
+        let radio: Bool
+        let server: URL
+    }
+    private var upcomingCachePlan: UpcomingCachePlan?
+    private var hasLoadedOnlineCatalog = false
 
     private let musicClient: OnlineMusicClient
     private var connectionToken = ""
@@ -227,8 +277,11 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         case .favorites: "我的收藏"
         case .radio: "我的电台"
         case .artists: "所有歌手"
+        case .playlists: "我的歌单"
+        case .onlinePlaylists: "在线歌单"
         case .artist(let id): artists.first { $0.id == id }?.name ?? "歌手"
         case .playlist(let id): playlists.first { $0.id == id }?.name ?? "歌单"
+        case .onlinePlaylist(let id): onlinePlaylists.first { $0.id == id }?.name ?? "在线歌单"
         }
     }
     var sectionSubtitle: String {
@@ -238,8 +291,11 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         case .favorites: "每一次心动，都有迹可循。"
         case .radio: "一首接一首，把下一次心动交给电台。"
         case .artists: "从一个名字，听见更多喜欢。"
+        case .playlists: "把喜欢的声音，整理成属于自己的歌单。"
+        case .onlinePlaylists: isOnline ? "来自服务器的共享歌单，选择一张开始聆听。" : "已保存的在线歌单，离线时可收听其中已缓存的歌曲。"
         case .artist: "这位歌手在你曲库中的全部歌曲。"
         case .playlist: "属于你的音乐片刻。"
+        case .onlinePlaylist: isOnline ? "来自服务器的在线歌单 · 选择歌曲或播放全部。" : "离线收听 · 仅显示这张在线歌单中已缓存的歌曲。"
         }
     }
     var sectionTracks: [Track] { sectionContent.tracks }
@@ -252,8 +308,15 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         case .all: result = availableTracks
         case .recent: result = Array(availableTracks.sorted { $0.importedAt > $1.importedAt }.prefix(50))
         case .favorites: result = availableTracks.filter(\.isFavorite)
-        case .artists, .radio: result = []
+        case .artists, .radio, .playlists, .onlinePlaylists: result = []
         case .artist(let id): result = artists.first { $0.id == id }?.tracks ?? []
+        case .onlinePlaylist(let id):
+            let ids = onlinePlaylists.first { $0.id == id }?.trackIds ?? []
+            var songs: [UUID: Track] = [:]
+            for song in availableTracks where song.source(on: configuredServer) != nil {
+                if let source = song.source(on: configuredServer) { songs[source.id] = song }
+            }
+            result = ids.compactMap { songs[$0] }
         case .playlist(let id):
             let ids = playlists.first { $0.id == id }?.trackIDs ?? []
             let available = Set(availableTracks.map(\.id))
@@ -275,12 +338,16 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private var sortedSectionTracks: [Track] {
+        // Shared playlists always use their saved server order. Library sorting
+        // remains available in local views; shuffle is an explicit playback action.
+        if isOnlinePlaylistSection { return sectionTracks }
         let key = TrackQuery(section: section, search: "", sort: sort)
         if let cached = trackQueryCache[key] { return cached }
         var result = sectionTracks
         switch sort {
         case .added:
             if case .playlist = section { break }
+            if case .onlinePlaylist = section { break }
             result.sort { $0.importedAt > $1.importedAt }
         case .title: result.sort { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
         case .artist: result.sort { $0.artist.localizedStandardCompare($1.artist) == .orderedAscending }
@@ -315,6 +382,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             let state = try LibraryPersistence.load(from: storageURL)
             tracks = state.tracks
             playlists = state.playlists
+            onlinePlaylistCache = state.onlinePlaylists
             queue = state.queue
             mode = state.mode
             volume = state.volume
@@ -355,6 +423,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func saveConnectionSettings(server: String, enabled: Bool, token: String, clearToken: Bool) throws {
+        guard !isManagingStorage else { throw OnlineLibraryError.message("请等待上传或清理完成。") }
         let url = try OnlineSettings.serverURL(server)
         let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard token.count <= 1000, !token.contains(where: { $0.isNewline }) else {
@@ -365,13 +434,17 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         try FileManager.default.createDirectory(at: connectionSettingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(settings).write(to: connectionSettingsURL, options: .atomic)
         endRadio()
+        hasLoadedOnlineCatalog = false
         onlineSettings = settings
+        onlinePlaylistMessage = ""
+        if isOnlinePlaylistSection { section = .all }
         connectionToken = MusicCredentials.read(server: url)
         useOfflineMode(message: "离线模式 · 本地与已缓存音乐")
         reconnect()
     }
 
     func reconnect() {
+        guard !isManagingStorage else { return }
         connectionTask?.cancel()
         let attempt = UUID()
         connectionAttempt = attempt
@@ -394,10 +467,23 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 let incoming = try records.map { try $0.track(server: server, cacheRoot: self.musicCacheURL) }
                 try Task.checkCancellation()
                 guard connectionAttempt == attempt else { return }
-                mergeOnlineTracks(incoming)
+                try await synchronizeCatalog(incoming, server: server)
+                hasLoadedOnlineCatalog = true
                 isOnline = true
                 connectionMessage = "在线模式 · \(incoming.count) 首服务器歌曲"
                 invalidateLibraryQueries()
+                refreshUpcomingCache()
+                // A missing playlist feature must not disconnect a healthy music catalog.
+                do {
+                    let lists = try await musicClient.playlists(server: server, token: token)
+                    try Task.checkCancellation()
+                    guard connectionAttempt == attempt else { return }
+                    mergeOnlinePlaylists(lists, server: server)
+                    onlinePlaylistMessage = ""
+                } catch {
+                    guard !Task.isCancelled, connectionAttempt == attempt else { return }
+                    onlinePlaylistMessage = "在线歌单暂时无法更新，保留上次列表。" + ((error as? OnlineLibraryError)?.localizedDescription ?? "请稍后刷新。")
+                }
             } catch {
                 guard !Task.isCancelled, connectionAttempt == attempt else { return }
                 useOfflineMode(message: (error as? OnlineLibraryError)?.localizedDescription ?? "连接不上服务器，当前使用离线模式。")
@@ -406,32 +492,71 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
 
-    // Keep local edits and stable IDs across refreshes. Deleted server songs
-    // remain available only when a playable local cache already exists.
+    // Partial radio responses merge without evicting other songs. Full catalogs
+    // additionally reconcile deleted songs through synchronizeCatalog().
     func mergeOnlineTracks(_ incoming: [Track], replacingOnlineIDs: Bool = true) {
-        if replacingOnlineIDs { onlineIDs = Set(incoming.map(\.id)) }
-        else { onlineIDs.formUnion(incoming.map(\.id)) }
         var merged = tracks
-        var positions = Dictionary(merged.enumerated().map { ($0.element.id, $0.offset) }, uniquingKeysWith: { first, _ in first })
+        var ids = Set<UUID>()
         for var song in incoming {
-            if let index = positions[song.id] {
+            if let index = merged.firstIndex(where: { $0.id == song.id || (song.remoteSource != nil && $0.source(on: song.remoteSource!.server)?.id == song.remoteSource?.id) }) {
                 let existing = merged[index]
+                song.id = existing.id
+                if existing.remoteSource == nil || existing.remoteSource?.sha256 == song.remoteSource?.sha256 { song.url = existing.url }
+                else if let source = song.remoteSource { song.url = musicCacheURL.appendingPathComponent("\(existing.id.uuidString)-\(source.sha256).\(song.url.pathExtension)") }
                 song.isFavorite = existing.isFavorite
                 song.playCount = existing.playCount
                 song.artworkData = existing.artworkData
+                song.cloudSources = existing.cloudSources
+                if existing.remoteSource == nil { song.remoteSource = nil }
                 if song.duration == 0 { song.duration = existing.duration }
                 if song.artist == "未知艺术家" { song.artist = existing.artist }
                 if song.album == "未知专辑" { song.album = existing.album }
-                if song != existing { merged[index] = song }
-            } else {
-                positions[song.id] = merged.count
-                merged.append(song)
-            }
+                merged[index] = song
+            } else { merged.append(song) }
+            ids.insert(song.id)
         }
+        if replacingOnlineIDs { onlineIDs = ids } else { onlineIDs.formUnion(ids) }
         if tracks != merged { tracks = merged; scheduleSave() }
     }
 
+    func synchronizeCatalog(_ incoming: [Track], server: URL) async throws {
+        let present = Set(incoming.compactMap { $0.remoteSource?.id })
+        let removed = tracks.filter { $0.source(on: server).map { !present.contains($0.id) } ?? false }
+        if !removed.isEmpty {
+            guard !isManagingStorage else { throw CancellationError() }
+            isManagingStorage = true
+            defer { isManagingStorage = false }
+            await prepareStorageChange(stopping: Set(removed.filter { $0.remoteSource != nil }.map(\.id)), cancelConnection: false)
+            for song in removed {
+                if let source = song.source(on: server) { try removeSourceCaches(source) }
+                if song.remoteSource != nil { try removeManagedCache(song); forgetTrack(song.id) }
+                else if let index = position(of: song.id) { tracks[index].cloudSources.removeAll { $0.server == server } }
+            }
+            ArtworkCache.clear()
+        }
+        try Task.checkCancellation()
+        mergeOnlineTracks(incoming)
+    }
+
+    func mergeOnlinePlaylists(_ lists: [ServerPlaylist], server: URL) {
+        onlinePlaylistCache[server.absoluteString] = lists
+        if server.absoluteString == onlineSettings.server,
+           case .onlinePlaylist(let id) = section, !lists.contains(where: { $0.id == id }) {
+            section = .onlinePlaylists
+        }
+        scheduleSave()
+    }
+
+    func openOnlineManagement() {
+        if let server = try? OnlineSettings.serverURL(onlineSettings.server) { NSWorkspace.shared.open(server.appendingPathComponent("music.html")) }
+    }
+
     func useOfflineMode(message: String) {
+        cancelUpcomingCache()
+        radioUpcomingIDs.removeAll { id in
+            guard let song = track(for: id) else { return true }
+            return !FileManager.default.fileExists(atPath: song.url.path)
+        }
         isOnline = false
         connectionMessage = message
         invalidateLibraryQueries()
@@ -443,15 +568,110 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         scheduleSave()
     }
 
+    private func cancelUpcomingCache() {
+        upcomingCacheAttempt = UUID()
+        upcomingCacheTask?.cancel()
+        upcomingCacheTask = nil
+        upcomingCachePlan = nil
+    }
+
+    private func refreshUpcomingCache() {
+        guard !isManagingStorage, isPlaying, isOnline, loadingTrackID == nil, let currentID = queue.currentID,
+              let server = try? OnlineSettings.serverURL(onlineSettings.server) else {
+            cancelUpcomingCache()
+            return
+        }
+        let radio = isRadioActive
+        let queuedIDs = queue.upcomingIDs(mode: mode)
+        let plan = UpcomingCachePlan(currentID: currentID, queuedIDs: queuedIDs, radio: radio, server: server)
+        // Periodic catalog refreshes must not restart a slow, valid download.
+        if upcomingCacheTask != nil, upcomingCachePlan == plan { return }
+        cancelUpcomingCache()
+        upcomingCachePlan = plan
+        let attempt = upcomingCacheAttempt
+        let token = connectionToken
+        upcomingCacheTask = Task(priority: .utility) { [weak self] in
+            guard let self, !Task.isCancelled, upcomingCacheAttempt == attempt else { return }
+            defer {
+                if upcomingCacheAttempt == attempt {
+                    upcomingCacheTask = nil
+                    upcomingCachePlan = nil
+                }
+            }
+            if radio {
+                if !hasLoadedOnlineCatalog {
+                    do {
+                        let records = try await musicClient.list(server: server, token: token)
+                        try Task.checkCancellation()
+                        guard upcomingCacheAttempt == attempt else { return }
+                        let incoming = try records.map { try $0.track(server: server, cacheRoot: self.musicCacheURL) }
+                        mergeOnlineTracks(incoming)
+                        hasLoadedOnlineCatalog = true
+                    } catch { return } // Look-ahead failures never interrupt the current song.
+                }
+                prepareRadioUpcoming(after: currentID, server: server)
+            }
+            let ids = radio ? radioUpcomingIDs : queuedIDs
+            for id in ids {
+                guard !Task.isCancelled, upcomingCacheAttempt == attempt,
+                      let song = track(for: id) else { return }
+                guard onlineIDs.contains(id), song.remoteSource?.server == server,
+                      !FileManager.default.fileExists(atPath: song.url.path) else { continue }
+                do {
+                    try await musicClient.download(song, token: token)
+                    try Task.checkCancellation()
+                    guard upcomingCacheAttempt == attempt else { return }
+                    // Metadata is optional here; validated audio is already cached.
+                    // Reading tags never starts playback or changes play counts.
+                    let metadata = try? await TrackImporter.read(song.url)
+                    try Task.checkCancellation()
+                    guard upcomingCacheAttempt == attempt else { return }
+                    if let metadata {
+                        applyDownloadedMetadata(metadata, to: song.id)
+                    }
+                    invalidateLibraryQueries()
+                    scheduleSave()
+                } catch {
+                    if Task.isCancelled { return }
+                    // Leave the next song eligible for a normal playback retry.
+                }
+            }
+        }
+    }
+
+    private func prepareRadioUpcoming(after currentID: UUID, server: URL) {
+        let candidates = tracks.filter { onlineIDs.contains($0.id) && $0.source(on: server) != nil }
+        let valid = Set(candidates.map(\.id))
+        radioUpcomingIDs.removeAll { !valid.contains($0) }
+        var used = Set(radioUpcomingIDs + [currentID])
+        while radioUpcomingIDs.count < 3 {
+            let last = radioUpcomingIDs.last ?? currentID
+            let unseen = candidates.filter { !used.contains($0.id) }
+            let alternatives = unseen.isEmpty ? candidates.filter { $0.id != last } : unseen
+            guard let song = (alternatives.isEmpty ? candidates : alternatives).randomElement() else { break }
+            radioUpcomingIDs.append(song.id)
+            used.insert(song.id)
+        }
+    }
+
+    private func applyDownloadedMetadata(_ metadata: Track, to id: UUID) {
+        guard let index = position(of: id) else { return }
+        tracks[index].duration = metadata.duration
+        tracks[index].artworkData = metadata.artworkData
+        if tracks[index].artist == "未知艺术家" { tracks[index].artist = metadata.artist }
+        if tracks[index].album == "未知专辑" { tracks[index].album = metadata.album }
+    }
+
     private func cancelAudioDownload() {
         playbackAttempt = UUID()
         audioDownloadTask?.cancel()
         audioDownloadTask = nil
         loadingTrackID = nil
+        downloadProgress.reset()
     }
 
     private func downloadForPlayback(_ track: Track, at position: Double) {
-        guard isOnline, onlineIDs.contains(track.id), track.remoteSource?.server.absoluteString == onlineSettings.server else {
+        guard isOnline, onlineIDs.contains(track.id), track.remoteSource?.server == configuredServer else {
             useOfflineMode(message: "连接不上服务器，当前使用离线模式。")
             showNotice("这首歌曲尚未缓存，请选择本地音乐或重新连接服务器。", error: true)
             if isRadioActive { playOfflineRadio() }
@@ -460,34 +680,42 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         let attempt = UUID()
         playbackAttempt = attempt
         loadingTrackID = track.id
+        downloadProgress.begin(track)
         let token = connectionToken
         audioDownloadTask = Task { [weak self] in
             guard let self else { return }
             do {
-                try await musicClient.download(track, token: token)
+                try await musicClient.download(track, token: token) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        guard let self, playbackAttempt == attempt, loadingTrackID == track.id else { return }
+                        downloadProgress.update(progress, for: track.id)
+                    }
+                }
                 try Task.checkCancellation()
+                guard playbackAttempt == attempt, queue.currentID == track.id else { return }
+                downloadProgress.update(TrackDownloadProgress(receivedBytes: track.remoteSource?.size ?? 0,
+                                                              totalBytes: track.remoteSource?.size ?? 0, phase: .preparing), for: track.id)
                 let metadata = try await TrackImporter.read(track.url)
                 try Task.checkCancellation()
                 guard playbackAttempt == attempt, queue.currentID == track.id else { return }
-                if let index = self.position(of: track.id) {
-                    tracks[index].duration = metadata.duration
-                    tracks[index].artworkData = metadata.artworkData
-                    if tracks[index].artist == "未知艺术家" { tracks[index].artist = metadata.artist }
-                    if tracks[index].album == "未知专辑" { tracks[index].album = metadata.album }
-                }
+                applyDownloadedMetadata(metadata, to: track.id)
                 loadCurrent(autoplay: true, at: position)
             } catch {
                 guard !Task.isCancelled, playbackAttempt == attempt else { return }
                 loadingTrackID = nil
+                downloadProgress.reset()
                 // Do not retain a corrupt/incomplete download as an offline song.
                 try? FileManager.default.removeItem(at: track.url)
-                useOfflineMode(message: (error as? OnlineLibraryError)?.localizedDescription ?? "歌曲下载失败，当前使用离线模式。")
-                showNotice("无法下载《\(track.title)》，已切换到离线模式；本地和已缓存音乐仍可播放。", error: true)
+                let message = (error as? OnlineLibraryError)?.localizedDescription ?? "歌曲下载或解析失败，请重试或换一首。"
+                if OnlineLibraryError.requiresOfflineMode(error) { useOfflineMode(message: message + " 当前使用离线模式。") }
+                else { connectionMessage = message }
+                showNotice("无法播放《\(track.title)》：" + message, error: true)
                 if isRadioActive { playOfflineRadio() }
-                else if currentTrack != nil { loadCurrent(autoplay: true) }
             }
         }
     }
+
+    @Published private(set) var radioUsesLocalSongs = false
 
     var radioTrack: Track? { track(for: radioTrackID) }
     var isRadioBuffering: Bool { isRadioLoading || (isRadioActive && loadingTrackID != nil) }
@@ -509,14 +737,17 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func endRadio() {
         cancelRadioRequest()
+        cancelUpcomingCache()
+        radioUpcomingIDs = []
         isRadioActive = false
     }
 
     func nextRadioTrack() {
+        guard !isManagingStorage else { return }
         let wasActive = isRadioActive
         cancelRadioRequest()
         cancelAudioDownload()
-        let previousSource = radioTrack?.remoteSource
+        let previousSource = radioTrack?.source(on: configuredServer)
         audioPlayer?.stop()
         audioPlayer = nil
         isPlaying = false
@@ -524,8 +755,17 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         playbackDuration = 0
         queue = PlaybackQueue()
         isRadioActive = true
+        if !wasActive { radioUpcomingIDs = [] }
         updateNowPlaying()
         scheduleSave()
+        while !radioUpcomingIDs.isEmpty {
+            let id = radioUpcomingIDs.removeFirst()
+            guard let song = track(for: id),
+                  isOnline ? (onlineIDs.contains(id) && song.source(on: configuredServer) != nil)
+                           : FileManager.default.fileExists(atPath: song.url.path) else { continue }
+            activateRadioTrack(song)
+            return
+        }
         guard onlineSettings.enabled, isOnline || !wasActive,
               let server = try? OnlineSettings.serverURL(onlineSettings.server) else {
             playOfflineRadio()
@@ -544,6 +784,9 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 let record = try await musicClient.radio(server: server, token: token, excluding: excluded)
                 try Task.checkCancellation()
                 guard radioAttempt == attempt else { return }
+                isOnline = true
+                connectionMessage = "在线模式 · 电台已连接"
+                invalidateLibraryQueries()
                 guard let record else {
                     isRadioActive = false
                     radioMessage = "服务器还没有可播放的歌曲，请先在歌曲管理页上传音乐。"
@@ -554,17 +797,31 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 isOnline = true
                 connectionMessage = "在线模式 · 电台收听中"
                 invalidateLibraryQueries()
-                radioTrackID = song.id
-                radioMessage = "来自你的在线曲库，听完自动为你换一首。"
-                queue = PlaybackQueue(ids: [song.id], startingAt: song.id)
-                selectedTrackID = song.id
-                loadCurrent(autoplay: true)
+                let linked = tracks.first { $0.source(on: server)?.id == record.id } ?? song
+                activateRadioTrack(linked)
             } catch {
                 guard !Task.isCancelled, radioAttempt == attempt else { return }
-                useOfflineMode(message: (error as? OnlineLibraryError)?.localizedDescription ?? "连接不上服务器，当前使用离线模式。")
+                let message: String
+                if case .http(let code) = error as? OnlineLibraryError, code == 404 || code == 405 {
+                    message = "服务器电台接口未启用（HTTP \(code)），请更新服务端。"
+                } else { message = (error as? OnlineLibraryError)?.localizedDescription ?? "连接不上服务器。" }
+                if OnlineLibraryError.requiresOfflineMode(error) { useOfflineMode(message: message + " 当前使用离线模式。") }
+                else { connectionMessage = message }
                 playOfflineRadio()
+                if isOnline { radioMessage = message + " 已使用本地电台，可以再次点击换一首重试。" }
             }
         }
+    }
+
+    private func activateRadioTrack(_ song: Track) {
+        radioUsesLocalSongs = !isOnline || song.source(on: configuredServer) == nil
+        radioTrackID = song.id
+        radioMessage = radioUsesLocalSongs
+            ? "离线电台 · 从本地和已缓存音乐中为你挑选。"
+            : "来自你的在线曲库，听完自动为你换一首。"
+        queue = PlaybackQueue(ids: [song.id], startingAt: song.id)
+        selectedTrackID = song.id
+        loadCurrent(autoplay: true)
     }
 
     private func playOfflineRadio() {
@@ -577,7 +834,8 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
         isRadioActive = true
         radioTrackID = song.id
-        radioMessage = "离线电台 · 从本地和已缓存音乐中为你挑选。"
+        radioUsesLocalSongs = true
+        radioMessage = (isOnline ? "本地电台" : "离线电台") + " · 从本地和已缓存音乐中为你挑选。"
         queue = PlaybackQueue(ids: [song.id], startingAt: song.id)
         selectedTrackID = song.id
         loadCurrent(autoplay: true)
@@ -681,6 +939,43 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         selectedTrackID = nil
     }
 
+    func showPlaylists(online: Bool) {
+        section = online ? .onlinePlaylists : .playlists
+        search = ""
+        selectedTrackID = nil
+    }
+
+    func showPlaylist(_ id: UUID, online: Bool) {
+        let exists = online ? onlinePlaylists.contains { $0.id == id } : playlists.contains { $0.id == id }
+        guard exists else { showPlaylists(online: online); return }
+        section = online ? .onlinePlaylist(id) : .playlist(id)
+        search = ""
+        selectedTrackID = nil
+    }
+
+    func playlistSummaries(online: Bool) -> [PlaylistSummary] {
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        let summaries: [PlaylistSummary]
+        if online {
+            var songs: [UUID: Track] = [:]
+            for track in tracks where track.source(on: configuredServer) != nil {
+                if let source = track.source(on: configuredServer) { songs[source.id] = track }
+            }
+            summaries = onlinePlaylists.map { list in
+                let contents = list.trackIds.compactMap { songs[$0] }
+                return PlaylistSummary(id: list.id, name: list.name, trackCount: list.trackIds.count,
+                                       artworkTrack: contents.first { $0.artworkData != nil } ?? contents.first)
+            }
+        } else {
+            summaries = playlists.map { list in
+                let contents = list.trackIDs.compactMap { track(for: $0) }
+                return PlaylistSummary(id: list.id, name: list.name, trackCount: list.trackIDs.count,
+                                       artworkTrack: contents.first { $0.artworkData != nil } ?? contents.first)
+            }
+        }
+        return query.isEmpty ? summaries : summaries.filter { $0.name.localizedStandardContains(query) }
+    }
+
     func showArtist(_ id: String) {
         section = .artist(id)
         search = ""
@@ -688,6 +983,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func playTrack(_ id: UUID, in source: [UUID]? = nil) {
+        guard !isManagingStorage else { return }
         endRadio()
         var ids = source ?? visibleTracks.map(\.id)
         if !ids.contains(id) { ids = [id] }
@@ -698,6 +994,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func playAll(shuffle: Bool = false) {
+        guard !isManagingStorage else { return }
         if section == .radio { nextRadioTrack(); return }
         endRadio()
         var ids = visibleTracks.map(\.id)
@@ -713,6 +1010,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func resume() {
+        guard !isManagingStorage else { return }
         guard !isPlaying else { return }
         if isRadioLoading { return }
         if isRadioActive && currentTrack == nil { nextRadioTrack(); return }
@@ -754,6 +1052,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func next(automatic: Bool = false) {
+        guard !isManagingStorage else { return }
         if isRadioActive { nextRadioTrack(); return }
         if queue.advance(mode: mode, automatic: automatic) { loadCurrent(autoplay: true) }
         else {
@@ -766,6 +1065,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func previous() {
+        guard !isManagingStorage else { return }
         if isRadioActive { seek(to: 0); return }
         if elapsed > 3 { seek(to: 0); return }
         if queue.retreat(mode: mode) { loadCurrent(autoplay: true) }
@@ -773,6 +1073,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func selectQueueIndex(_ index: Int) {
+        guard !isManagingStorage else { return }
         guard queue.ids.indices.contains(index) else { return }
         queue.select(index)
         loadCurrent(autoplay: true)
@@ -810,6 +1111,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func loadCurrent(autoplay: Bool, at position: Double = 0) {
+        guard !isManagingStorage else { return }
         cancelAudioDownload()
         audioPlayer?.stop()
         audioPlayer = nil
@@ -885,6 +1187,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func enqueueNext(_ id: UUID) {
+        guard !isManagingStorage else { return }
         endRadio()
         let hadCurrent = queue.currentID != nil
         queue.insertNext(id)
@@ -903,16 +1206,177 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     func clearUpcoming() { queue.clearUpcoming(); scheduleSave() }
 
-    func removeFromLibrary(_ id: UUID) {
-        let oldID = queue.currentID
-        let wasPlaying = isPlaying
+    private func forgetTrack(_ id: UUID) {
+        let source = track(for: id)?.remoteSource
         tracks.removeAll { $0.id == id }
+        onlineIDs.remove(id)
+        radioUpcomingIDs.removeAll { $0 == id }
         for index in playlists.indices { playlists[index].trackIDs.removeAll { $0 == id } }
+        for key in Array(onlinePlaylistCache.keys) {
+            onlinePlaylistCache[key] = onlinePlaylistCache[key]?.map { list in
+                ServerPlaylist(id: list.id, name: list.name, trackIds: list.trackIds.filter { raw in
+                    !(source?.server.absoluteString == key && source?.id == raw)
+                })
+            }
+        }
         queue.remove([id])
         if selectedTrackID == id { selectedTrackID = nil }
-        if oldID != queue.currentID { loadCurrent(autoplay: wasPlaying) }
         scheduleSave()
+    }
+
+    func removeFromLibrary(_ id: UUID) {
+        guard !isManagingStorage else { return }
+        let wasCurrent = queue.currentID == id
+        if wasCurrent { stop(); audioPlayer = nil }
+        forgetTrack(id)
+        if wasCurrent { loadCurrent(autoplay: false) }
         showNotice("已从曲库移除，原始音乐文件已保留。")
+    }
+
+    private func prepareStorageChange(stopping ids: Set<UUID>, cancelConnection: Bool = true) async {
+        if cancelConnection {
+            connectionAttempt = UUID(); connectionTask?.cancel(); isConnecting = false
+        }
+        let audioTask = audioDownloadTask, upcoming = upcomingCacheTask, pendingRadio = radioTask
+        cancelRadioRequest(); cancelUpcomingCache(); cancelAudioDownload()
+        if let current = currentTrack, ids.contains(current.id) {
+            audioPlayer?.stop(); audioPlayer = nil; isPlaying = false; elapsed = 0
+            playbackDuration = 0; isRadioActive = false; updateNowPlaying()
+        }
+        await musicClient.cancelDownloads()
+        await audioTask?.value; await upcoming?.value; await pendingRadio?.value
+    }
+
+    private func cacheFiles() throws -> [URL] {
+        guard FileManager.default.fileExists(atPath: musicCacheURL.path) else { return [] }
+        guard (try musicCacheURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else {
+            throw OnlineLibraryError.message("缓存目录是符号链接，已保留以避免误删。")
+        }
+        return try FileManager.default.contentsOfDirectory(at: musicCacheURL, includingPropertiesForKeys: nil)
+    }
+
+    private func removeSourceCaches(_ source: RemoteTrackSource) throws {
+        let prefix = source.cacheID.uuidString.lowercased() + "-"
+        for file in try cacheFiles() where file.lastPathComponent.lowercased().hasPrefix(prefix) { try FileManager.default.removeItem(at: file) }
+    }
+
+    private func removeManagedCache(_ song: Track) throws {
+        guard song.remoteSource != nil else { return }
+        let root = musicCacheURL.standardizedFileURL.resolvingSymlinksInPath()
+        guard song.url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath() == root else {
+            throw OnlineLibraryError.message("缓存路径不属于声屿，已保留该文件。")
+        }
+        if FileManager.default.fileExists(atPath: song.url.path) { try FileManager.default.removeItem(at: song.url) }
+    }
+
+    func deleteTrack(_ id: UUID, fromCloud: Bool, localFile: Bool) async {
+        guard !isManagingStorage, let song = track(for: id) else { return }
+        isManagingStorage = true; storageMessage = "正在删除歌曲…"
+        defer { isManagingStorage = false; storageMessage = ""; scheduleSave() }
+        do {
+            let server = try OnlineSettings.serverURL(onlineSettings.server)
+            let source = song.source(on: server)
+            if fromCloud {
+                guard let source else { throw OnlineLibraryError.message("请切换到这首歌曲所属的服务器后删除。") }
+                try await musicClient.delete(source, token: connectionToken)
+            }
+            await prepareStorageChange(stopping: (localFile || song.remoteSource != nil) ? [id] : [])
+            if fromCloud {
+                if let source { try removeSourceCaches(source) }
+                // Remove every reference to this cloud copy, retaining local originals.
+                for key in Array(onlinePlaylistCache.keys) where key == server.absoluteString {
+                    onlinePlaylistCache[key] = onlinePlaylistCache[key]?.map { ServerPlaylist(id: $0.id, name: $0.name, trackIds: $0.trackIds.filter { $0 != source?.id }) }
+                }
+                if song.remoteSource != nil { try removeManagedCache(song); forgetTrack(id) }
+                else if let index = position(of: id) { tracks[index].cloudSources.removeAll { $0.server == server }; onlineIDs.remove(id) }
+            }
+            if localFile && song.remoteSource == nil {
+                if FileManager.default.fileExists(atPath: song.url.path) { try FileManager.default.trashItem(at: song.url, resultingItemURL: nil) }
+                if let index = position(of: id), let remaining = tracks[index].cloudSources.first {
+                    tracks[index].remoteSource = remaining
+                    tracks[index].cloudSources = []
+                    tracks[index].url = musicCacheURL.appendingPathComponent("\(id.uuidString)-\(remaining.sha256).\(song.url.pathExtension.lowercased())")
+                } else { forgetTrack(id) }
+            }
+            ArtworkCache.clear(); invalidateLibraryQueries(); updateNowPlaying()
+            showNotice(fromCloud ? "云端歌曲和对应缓存已删除，本地原文件已保留。" : "本地音乐已移到废纸篓。")
+        } catch {
+            showNotice("删除未完成：" + error.localizedDescription, error: true)
+        }
+    }
+
+    func clearOnlineCache() async {
+        guard !isManagingStorage else { return }
+        isManagingStorage = true; storageMessage = "正在清空缓存…"
+        defer { isManagingStorage = false; storageMessage = ""; scheduleSave() }
+        await prepareStorageChange(stopping: Set(tracks.filter { $0.remoteSource != nil }.map(\.id)))
+        do {
+            let files = try cacheFiles()
+            for file in files { try FileManager.default.removeItem(at: file) }
+            for index in tracks.indices where tracks[index].remoteSource != nil { tracks[index].artworkData = nil }
+            ArtworkCache.clear(); invalidateLibraryQueries()
+            if !isOnline { queue = queue.validated(against: Set(availableTracks.map(\.id))) }
+            updateNowPlaying(); showNotice("在线音频和封面缓存已清空，收藏、歌单和本地原文件已保留。")
+        } catch { showNotice("部分缓存未能清理：" + error.localizedDescription, error: true) }
+    }
+
+    var onlineCacheBytes: Int64 {
+        let files = (try? FileManager.default.contentsOfDirectory(at: musicCacheURL, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+        return files.reduce(0) { $0 + Int64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+    }
+
+    private func uploadSong(_ id: UUID, server: URL, token: String) async throws -> UUID {
+        guard let song = track(for: id) else { throw OnlineLibraryError.message("歌曲已被移除。") }
+        if let source = song.source(on: server) { return source.id }
+        guard song.remoteSource == nil else { throw OnlineLibraryError.message("《\(song.title)》属于另一台服务器，请切换到该服务器后上传歌单。") }
+        guard song.hasLocalCopy else { throw OnlineLibraryError.message("《\(song.title)》尚无本地文件，请先缓存后再上传。") }
+        let record = try await musicClient.upload(song, server: server, token: token)
+        let remote = try record.track(server: server, cacheRoot: musicCacheURL)
+        guard let source = remote.remoteSource, let index = position(of: id) else { throw CancellationError() }
+        tracks[index].cloudSources.removeAll { $0.server == server }
+        tracks[index].cloudSources.append(source)
+        onlineIDs.insert(id)
+        // A matching cloud row may already exist; retain the original's identity.
+        if remote.id != id, tracks.contains(where: { $0.id == remote.id }) {
+            let duplicate = tracks.first { $0.id == remote.id }!
+            tracks[index].isFavorite = tracks[index].isFavorite || duplicate.isFavorite
+            tracks[index].playCount = max(tracks[index].playCount, duplicate.playCount)
+            for i in playlists.indices {
+                var seen = Set<UUID>()
+                playlists[i].trackIDs = playlists[i].trackIDs.map { $0 == duplicate.id ? id : $0 }.filter { seen.insert($0).inserted }
+            }
+            if selectedTrackID == duplicate.id { selectedTrackID = id }
+            queue.replace(duplicate.id, with: id)
+            tracks.removeAll { $0.id == duplicate.id }
+        }
+        scheduleSave()
+        return record.id
+    }
+
+    func uploadToCloud(trackID: UUID? = nil, playlistID: UUID? = nil) async {
+        guard !isManagingStorage else { return }
+        isManagingStorage = true; storageMessage = "正在上传云端…"
+        defer { isManagingStorage = false; storageMessage = "" }
+        connectionAttempt = UUID(); connectionTask?.cancel(); isConnecting = false
+        do {
+            let server = try OnlineSettings.serverURL(onlineSettings.server), token = connectionToken
+            if let playlistID, let list = playlists.first(where: { $0.id == playlistID }) {
+                var ids: [UUID] = []
+                for (offset, id) in list.trackIDs.enumerated() {
+                    storageMessage = "上传歌单：\(offset + 1) / \(list.trackIDs.count)"
+                    ids.append(try await uploadSong(id, server: server, token: token))
+                }
+                let uploaded = try await musicClient.uploadPlaylist(list, trackIDs: ids, server: server, token: token)
+                var lists = onlinePlaylistCache[server.absoluteString] ?? []
+                lists.removeAll { $0.id == uploaded.id }; lists.append(uploaded)
+                mergeOnlinePlaylists(lists, server: server)
+                showNotice("已上传歌单「\(list.name)」，云端按本地歌单顺序播放。")
+            } else if let trackID {
+                _ = try await uploadSong(trackID, server: server, token: token)
+                showNotice("歌曲已上传云端。")
+            }
+            invalidateLibraryQueries(); scheduleSave()
+        } catch { showNotice("上传未完成：" + error.localizedDescription + " 已上传的歌曲会保留，再次上传会继续。", error: true) }
     }
 
     func savePlaylist(name: String, editing id: UUID?, adding trackID: UUID? = nil) {
@@ -936,7 +1400,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     func deletePlaylist(_ id: UUID) {
         playlists.removeAll { $0.id == id }
-        if section == .playlist(id) { section = .all }
+        if section == .playlist(id) { section = .playlists }
         scheduleSave()
     }
 
@@ -988,7 +1452,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private func snapshotForSaving() -> LibrarySnapshot {
         let position = isPlaying ? (audioPlayer?.currentTime ?? elapsed) : elapsed
         return LibrarySnapshot(tracks: tracks, playlists: playlists, queue: queue,
-                               mode: mode, volume: volume, elapsed: position)
+                               mode: mode, volume: volume, elapsed: position, onlinePlaylists: onlinePlaylistCache)
     }
 
     private func persistInBackground() {

@@ -81,6 +81,24 @@ struct RenderingContractTests {
         expect(page != LibraryPage(model: model, showAlbum: false), "Crossing the breakpoint must change the page value")
         print("PASS: queue rows and page resize boundary")
 
+        model.downloadProgress.begin(tracks[0])
+        var pageUpdates = 0
+        var progressUpdates = 0
+        let pageSubscription = model.objectWillChange.sink { pageUpdates += 1 }
+        let progressSubscription = model.downloadProgress.$active.dropFirst().sink { _ in progressUpdates += 1 }
+        for received in 1...50 {
+            model.downloadProgress.update(TrackDownloadProgress(receivedBytes: Int64(received), totalBytes: 100), for: tracks[0].id)
+        }
+        expect(pageUpdates == 0 && progressUpdates == 50, "download ticks must update only the progress views, not the library model")
+        model.downloadProgress.update(TrackDownloadProgress(receivedBytes: 10, totalBytes: 100), for: tracks[0].id)
+        model.downloadProgress.update(TrackDownloadProgress(receivedBytes: 90, totalBytes: 100), for: tracks[1].id)
+        expect(model.downloadProgress.active?.progress.percentage == 50, "out-of-order and stale song progress must be ignored")
+        model.downloadProgress.reset()
+        expect(model.downloadProgress.active == nil, "cancelled download must clear its visible state")
+        pageSubscription.cancel()
+        progressSubscription.cancel()
+        print("PASS: download progress isolation and stale-value guards")
+
         let mini = NSSize(width: 380, height: 124)
         let full = NSSize(width: 980, height: 700)
         let unlimited = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
@@ -137,7 +155,7 @@ struct RenderingContractTests {
         expect(ArtworkRequest(track: tracks[0], pixelSize: 104) == nil, "Missing artwork should use the placeholder")
         print("PASS: cancelled, missing and invalid artwork")
 
-        print("6 rendering contract groups, \(failures) failures; no window created")
+        print("7 rendering contract groups, \(failures) failures; no window created")
         if failures > 0 { exit(1) }
     }
 }

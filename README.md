@@ -6,6 +6,8 @@ A native macOS music player built with SwiftUI, AppKit, and AVFoundation. Sonora
 
 No third-party dependencies. The application interface is currently in Simplified Chinese.
 
+An Android client is available in [android/](android/README.md), with online/offline playback, radio, favorites, playlists, and background media controls. Build its installable APK with `bash Scripts/build-android.sh`.
+
 ## Features
 
 - **Local library:** import files or folders recursively, drag music into the window, or use Finder’s **Open With** menu. Duplicate file paths are skipped.
@@ -16,8 +18,11 @@ No third-party dependencies. The application interface is currently in Simplifie
 - **Playback queue:** view upcoming tracks, play a track next, remove queue entries, or clear upcoming tracks.
 - **Track information:** read embedded titles, artists, albums, artwork, and duration. Filenames are used when title tags are missing; tracks without artwork use a plain dark placeholder.
 - **Find the current track:** click **定位当前**, click the artwork or track information in the playback bar, or press `⌘J` to reveal and highlight the playing track.
+- **Cloud uploads and source badges:** upload an individual local song from its menu or a whole local playlist from its detail page. Identical audio is reused, playlist order is retained, and uploaded originals keep their identity. Disk and cloud icons show local and cloud copies together.
+- **Deletion and cache cleanup:** each song has a confirmed delete action for its cloud copy or local original. Mac originals move to Trash; removing only a library entry remains available. Clear audio and artwork caches in server settings while retaining originals, favorites, playlists and credentials. Successfully refreshed server catalogs remove deleted cloud songs and caches; offline devices reconcile when they reconnect.
 - **Online and offline listening:** browse server tracks, download on first playback, and keep listening to local and cached music when the server is unavailable.
-- **My Radio:** open **我的电台** in the sidebar to fetch and play one random server song. Skip with **换一首** or the player’s Next button; finishing a song fetches another. Offline radio selects local or cached songs.
+- **My Radio:** open **我的电台** in the sidebar to play random server songs. Skip with **换一首** or the player’s Next button; finishing a song advances automatically. Offline radio selects local or cached songs.
+- **Look-ahead caching:** while playing, cache the next three songs and replenish after each skip. Regular playback follows the queue; radio prepares random upcoming selections. Local and cached files are reused. Pausing, stopping, or disconnecting cancels prefetch; background failures leave the current song playing.
 - **Native integration:** macOS Now Playing information and media commands, keyboard shortcuts, and saved library and playback state. Playback stays paused when the app is reopened.
 
 Supported file extensions: **MP3, M4A, AAC, WAV, AIF, AIFF, CAF, and FLAC**. Actual codec support depends on macOS decoding capabilities.
@@ -45,7 +50,7 @@ To create an app bundle yourself, follow [Build from source](#build-from-source)
 3. Use the heart to favorite a track and “＋” to add it to a playlist. Right-click a track for more actions, including revealing its file in Finder or removing it from the library.
 4. Press `⌥⌘M` to switch between the full player and mini player.
 
-Local music stays at its original location: importing does not copy files, and removing a library entry does not delete the original. If you move a music file, remove the unavailable entry and import it again.
+Local music stays at its original location: importing does not copy files, and removing a library entry does not delete the original. The separate local-file delete action moves it to Trash. If you move a music file, remove the unavailable entry and import it again.
 
 Closing the window allows playback to continue in the background. Use `⌘Q` to quit the app.
 
@@ -57,7 +62,11 @@ Online mode is enabled by default with a preconfigured server address. You can c
 2. Enter the server’s HTTPS base URL and, if required, its access token. Local development also accepts HTTP on `localhost`, `127.0.0.1`, or `::1`.
 3. Click **保存并连接** (“Save and Connect”). Leave the token field empty to retain the token already saved for that server, or select the clear-token option to remove it.
 
-While online mode is enabled, the app refreshes the connection and track list every 30 seconds. Connection or download failures switch the library to local and already-cached music. Uncached server tracks require a working connection; their first playback waits for the download to complete. Downloads are checked against the server’s file size and SHA-256 digest before being cached.
+While online mode is enabled, the app refreshes the connection and track list every 30 seconds. Connection failures or expired authentication switch the library to local and already-cached music; errors in an individual feature or song keep the healthy catalog online. Uncached server tracks require a working connection; their first playback waits for the download to complete. Downloads are checked against the server’s file size and SHA-256 digest before being cached.
+
+The **在线歌单** and **我的歌单** sidebar entries open separate playlist collection pages. Select a playlist card for its tracks and use the back link to return. Collection search matches playlist names, and local cards retain create, rename and delete actions.
+
+Create shared online playlists in the music management page, then upload into a playlist or add selected library songs. Select a playlist under **在线歌单** in the sidebar and double-click a song or use **播放全部** to play it in server order. Reorder tracks by dragging within a playlist in the management page, or use its up/down controls; changes save immediately. After refreshing the client, start the playlist again to build a queue in the saved order. Library sort settings do not override online playlist order. Lists refresh every 30 seconds and remain visible offline with their cached songs. Shared server playlists remain separate from device-local playlists.
 
 Access tokens are stored in macOS Keychain, separately for each server. The **打开歌曲管理** (“Open Music Management”) button opens the server’s `/music.html` page in your browser.
 
@@ -65,6 +74,12 @@ A compatible server is required; its backend is not included in this repository.
 
 | Endpoint | Purpose |
 | --- | --- |
+| `GET /api/music/playlists` | Return playlists with `id`, `name` and an ordered UUID array `trackIds`. |
+| `POST /api/music/tracks?reuseExisting=true` | Upload multipart audio, reusing identical files. |
+| `DELETE /api/music/tracks/{id}` | Delete audio and all online playlist references. |
+| `POST /api/music/playlists` | Create with an optional stable local playlist UUID. |
+| `POST /api/music/playlists/{id}/tracks` | Append ordered batches of songs. |
+| `PUT /api/music/playlists/{id}/order` | Save order with an expected previous order. |
 | `GET /api/music/tracks` | Return a JSON array of track metadata. |
 | `GET /api/music/tracks/{id}/audio` | Download a track’s audio file. |
 | `GET /api/music/tracks/radio?exclude=<UUID>` | Pick one playable server song, avoiding the previous song when another is available. Returns 204 for an empty radio. |
@@ -128,7 +143,7 @@ Use the repository’s shell scripts to compile and run the test executables:
 | Command | Coverage |
 | --- | --- |
 | `bash Scripts/test.sh` | Queue rules, playback state, persistence, import and decoding, playlists, current-track navigation, artist statistics, caching, and isolated progress/volume/selection updates. |
-| `bash Scripts/test-online.sh` | Mocked server authentication, timeout fallback and recovery, stable identities, compatibility, offline cache availability, and download integrity. No windows or audio playback. |
+| `bash Scripts/test-online.sh` | Mocked authentication, fallback, caching, integrity, and online playlists; a temporary loopback HTTP server checks live download progress, sharing, cancellation, and redirect rejection. No external server, windows, or audio playback. |
 | `bash Scripts/test-performance.sh` | Page-data reads for 5,000 simulated tracks; each warmed-up case has a total budget of 100 ms for 8 refreshes. |
 | `bash Scripts/test-rendering.sh` | Row values, update boundaries, layout breakpoints, window-constraint logic, and background artwork loading, caching, and cancellation. |
 | `bash Scripts/test-mini-window.sh` | Mini/full window constraints and restoration using an offscreen test window. |
