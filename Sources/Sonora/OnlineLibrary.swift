@@ -1,4 +1,6 @@
 import Foundation
+import AVFoundation
+import UniformTypeIdentifiers
 import CryptoKit
 import Security
 
@@ -175,6 +177,33 @@ private final class MusicFileDownload: @unchecked Sendable {
     }
 }
 
+// Observe bytes written by the upload task, without persisting credentials.
+private final class MusicFileUpload: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: URLSessionUploadTask?
+    private var observation: NSKeyValueObservation?
+    private var cancelled = false
+    func run(session: URLSession, request: URLRequest, file: URL, onBytes: @escaping @Sendable (Int64) -> Void) async throws -> (Data, URLResponse) {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let task = session.uploadTask(with: request, fromFile: file) { data, response, error in
+                    self.lock.lock(); let observation = self.observation; self.observation = nil; self.task = nil; self.lock.unlock()
+                    observation?.invalidate()
+                    if let error { continuation.resume(throwing: error); return }
+                    guard let response else { continuation.resume(throwing: URLError(.badServerResponse)); return }
+                    continuation.resume(returning: (data ?? Data(), response))
+                }
+                task.delegate = MusicRequestDelegate()
+                let observation = task.observe(\.countOfBytesSent, options: [.initial, .new]) { task, _ in onBytes(task.countOfBytesSent) }
+                lock.lock(); self.task = task; self.observation = observation; let shouldCancel = cancelled; lock.unlock()
+                if shouldCancel { task.cancel() } else { task.resume() }
+            }
+        } onCancel: {
+            self.lock.lock(); self.cancelled = true; let task = self.task; self.lock.unlock(); task?.cancel()
+        }
+    }
+}
+
 // Playback and look-ahead caching share a transfer. Cancelling one consumer
 // only cancels the network request when nobody else still needs the file.
 private actor MusicDownloadCache {
@@ -186,12 +215,14 @@ private actor MusicDownloadCache {
         var lastBroadcast: TimeInterval = 0
     }
     private var transfers: [URL: Transfer] = [:]
-    private var retiring: [UUID: Task<Void, Error>] = [:]
+    private var retiring: [UUID: (url: URL, task: Task<Void, Error>)] = [:]
 
-    func cancelAndDrain() async {
-        let pending = Array(transfers.values.map(\.task)) + Array(retiring.values)
-        transfers.removeAll()
-        retiring.removeAll()
+    func cancelAndDrain(urls: Set<URL>? = nil) async {
+        let active = transfers.filter { urls == nil || urls!.contains($0.key) }
+        let old = retiring.filter { urls == nil || urls!.contains($0.value.url) }
+        let pending = Array(active.values.map(\.task)) + old.values.map(\.task)
+        for key in active.keys { transfers[key] = nil }
+        for key in old.keys { retiring[key] = nil }
         pending.forEach { $0.cancel() }
         for task in pending { _ = await task.result }
     }
@@ -258,7 +289,7 @@ private actor MusicDownloadCache {
             transfer.task.cancel()
             transfers[url] = nil
             let id = transfer.id
-            retiring[id] = transfer.task
+            retiring[id] = (url: url, task: transfer.task)
             Task { _ = await transfer.task.result; self.finishedRetiring(id) }
         } else { transfers[url] = transfer }
     }
@@ -317,7 +348,7 @@ struct OnlineMusicClient: Sendable {
         return try JSONDecoder().decode(ServerTrack.self, from: data)
     }
 
-    func cancelDownloads() async { await downloads.cancelAndDrain() }
+    func cancelDownloads(urls: Set<URL>? = nil) async { await downloads.cancelAndDrain(urls: urls) }
 
     func delete(_ source: RemoteTrackSource, token: String) async throws {
         var request = request(source.server.appendingPathComponent("api/music/tracks/\(source.id.uuidString.lowercased())"), token: token, timeout: 15)
@@ -353,7 +384,7 @@ struct OnlineMusicClient: Sendable {
         return list
     }
 
-    func upload(_ track: Track, server: URL, token: String) async throws -> ServerTrack {
+    func upload(_ track: Track, server: URL, token: String, onProgress: DownloadProgressHandler? = nil) async throws -> ServerTrack {
         let boundary = "Sonora-\(UUID().uuidString)"
         let bodyURL = FileManager.default.temporaryDirectory.appendingPathComponent("sonora-upload-\(UUID())")
         defer { try? FileManager.default.removeItem(at: bodyURL) }
@@ -379,7 +410,10 @@ struct OnlineMusicClient: Sendable {
         var request = request(server.appendingPathComponent("api/music/tracks").appending(queryItems: [URLQueryItem(name: "reuseExisting", value: "true")]), token: token, timeout: 180)
         request.httpMethod = "POST"
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        let (data, response) = try await session.upload(for: request, fromFile: bodyURL)
+        let total = Int64((try bodyURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        let (data, response) = try await MusicFileUpload().run(session: session, request: request, file: bodyURL) { sent in
+            onProgress?(TrackDownloadProgress(receivedBytes: min(max(0, sent), total), totalBytes: total))
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 || status == 201 else { throw OnlineLibraryError.http(status) }
         return try JSONDecoder().decode(ServerTrack.self, from: data)
@@ -452,4 +486,82 @@ enum MusicCredentials {
         }
         guard result == errSecSuccess else { throw OnlineLibraryError.message("无法把访问令牌保存到系统钥匙串。") }
     }
+}
+
+// AVPlayer asks this loader for byte ranges. Every request goes through the
+// same ephemeral, redirect-rejecting session as the rest of the music API.
+final class MusicStreamingResource: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
+    let asset: AVURLAsset
+    private let source: RemoteTrackSource
+    private let token: String
+    private let session: URLSession
+    private let contentType: String
+    private let lock = NSLock()
+    private var tasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+    private var stopped = false
+    private let callbackQueue = DispatchQueue(label: "studio.sonora.stream.loader")
+
+    init(track: Track, token: String, session: URLSession) throws {
+        guard let source = track.remoteSource else { throw OnlineLibraryError.message("歌曲没有服务器地址。") }
+        self.source = source; self.token = token; self.session = session
+        contentType = UTType(filenameExtension: track.url.pathExtension)?.identifier ?? UTType.audio.identifier
+        let url = URL(string: "sonora-audio://stream/\(source.id.uuidString).\(track.url.pathExtension)")!
+        asset = AVURLAsset(url: url)
+        super.init()
+        asset.resourceLoader.setDelegate(self, queue: callbackQueue)
+    }
+
+    func resourceLoader(_ resourceLoader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource request: AVAssetResourceLoadingRequest) -> Bool {
+        let key = ObjectIdentifier(request)
+        lock.lock()
+        guard !stopped else { lock.unlock(); return false }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer { self.remove(key) }
+            do {
+                if let info = request.contentInformationRequest {
+                    info.contentType = self.contentType
+                    info.contentLength = self.source.size
+                    info.isByteRangeAccessSupported = true
+                }
+                if let dataRequest = request.dataRequest {
+                    let start = max(dataRequest.requestedOffset, dataRequest.currentOffset)
+                    let requestedEnd = dataRequest.requestsAllDataToEndOfResource ? self.source.size : min(self.source.size, dataRequest.requestedOffset + Int64(dataRequest.requestedLength))
+                    var offset = start
+                    while offset < requestedEnd {
+                        try Task.checkCancellation()
+                        let end = min(requestedEnd - 1, offset + 128 * 1024 - 1)
+                        var urlRequest = URLRequest(url: self.source.server.appendingPathComponent("api/music/tracks/\(self.source.id.uuidString.lowercased())/audio"), cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+                        if !self.token.isEmpty { urlRequest.setValue("Bearer \(self.token)", forHTTPHeaderField: "Authorization") }
+                        urlRequest.setValue("bytes=\(offset)-\(end)", forHTTPHeaderField: "Range")
+                        let (data, response) = try await self.session.data(for: urlRequest)
+                        guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+                        guard response.statusCode == 206 else { throw OnlineLibraryError.http(response.statusCode) }
+                        let expected = "bytes \(offset)-\(end)/\(self.source.size)"
+                        guard response.value(forHTTPHeaderField: "Content-Range") == expected, data.count == Int(end - offset + 1) else { throw URLError(.badServerResponse) }
+                        try Task.checkCancellation()
+                        dataRequest.respond(with: data)
+                        offset = end + 1
+                    }
+                }
+                try Task.checkCancellation()
+                request.finishLoading()
+            } catch { request.finishLoading(with: error) }
+        }
+        tasks[key] = task
+        lock.unlock()
+        return true
+    }
+
+    func resourceLoader(_ resourceLoader: AVAssetResourceLoader, didCancel request: AVAssetResourceLoadingRequest) {
+        let key = ObjectIdentifier(request)
+        lock.lock(); let task = tasks.removeValue(forKey: key); lock.unlock()
+        task?.cancel()
+    }
+    private func remove(_ key: ObjectIdentifier) { lock.lock(); tasks.removeValue(forKey: key); lock.unlock() }
+    func stop() {
+        lock.lock(); stopped = true; let values = Array(tasks.values); tasks.removeAll(); lock.unlock()
+        values.forEach { $0.cancel() }
+    }
+    deinit { stop() }
 }

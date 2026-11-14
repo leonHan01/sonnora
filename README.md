@@ -62,7 +62,7 @@ Online mode is enabled by default with a preconfigured server address. You can c
 2. Enter the server’s HTTPS base URL and, if required, its access token. Local development also accepts HTTP on `localhost`, `127.0.0.1`, or `::1`.
 3. Click **保存并连接** (“Save and Connect”). Leave the token field empty to retain the token already saved for that server, or select the clear-token option to remove it.
 
-While online mode is enabled, the app refreshes the connection and track list every 30 seconds. Connection failures or expired authentication switch the library to local and already-cached music; errors in an individual feature or song keep the healthy catalog online. Uncached server tracks require a working connection; their first playback waits for the download to complete. Downloads are checked against the server’s file size and SHA-256 digest before being cached.
+While online mode is enabled, the app refreshes the connection and track list every 30 seconds. Connection failures or expired authentication switch the library to local and already-cached music; errors in an individual feature or song keep the healthy catalog online. Uncached server tracks require a working connection and play while data is read. A background download is retained for offline listening only after its size and SHA-256 digest are verified. Playback may make additional range requests, increasing initial network usage.
 
 The **在线歌单** and **我的歌单** sidebar entries open separate playlist collection pages. Select a playlist card for its tracks and use the back link to return. Collection search matches playlist names, and local cards retain create, rename and delete actions.
 

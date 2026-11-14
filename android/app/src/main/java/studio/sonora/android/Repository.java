@@ -4,6 +4,8 @@ import android.content.*;
 import android.database.Cursor;
 import android.graphics.*;
 import android.media.MediaMetadataRetriever;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
 import android.net.Uri;
 import android.os.*;
 import android.provider.OpenableColumns;
@@ -18,7 +20,10 @@ import java.util.concurrent.*;
 
 /** Main-thread catalog mutations, serial atomic persistence, isolated network workers. */
 public final class Repository {
-    public interface Listener { void changed(boolean settingsChanged); }
+    public interface Listener {
+        void changed(boolean settingsChanged);
+        default void progressChanged() {}
+    }
     public static final class Playlist {
         public String id = UUID.randomUUID().toString(), name;
         public final ArrayList<String> keys = new ArrayList<>();
@@ -49,10 +54,14 @@ public final class Repository {
     private final List<Listener> listeners = new ArrayList<>();
     private final AtomicFile storage;
     private boolean canSave = true;
-    public boolean online, refreshing, storageBusy;
-    public interface StorageCleaner { void drain(Set<String> stopping, Runnable completion); }
+    public boolean online, refreshing, storageBusy, uploading, checkingInvalidSongs;
+    public int uploadPercent = -1;
+    private int uploadGeneration, activeUploads;
+    private final ExecutorService uploadWorkers = Executors.newCachedThreadPool();
+    private final Map<String, CompletableFuture<String>> songUploads = new HashMap<>();
+    public interface StorageCleaner { void drain(Set<String> stopping, boolean allCaches, Runnable completion); }
     public StorageCleaner storageCleaner;
-    private void drain(Set<String> stopping, Runnable completion) { if (storageCleaner == null) completion.run(); else storageCleaner.drain(stopping, completion); }
+    private void drain(Set<String> stopping, boolean allCaches, Runnable completion) { if (storageCleaner == null) completion.run(); else storageCleaner.drain(stopping, allCaches, completion); }
     private void startStorageChange() {
         storageBusy = true; refreshGeneration++; refreshing = false;
         if (refreshTask != null) refreshTask.cancel(true);
@@ -78,6 +87,7 @@ public final class Repository {
     public void observe(Listener listener) { if (!listeners.contains(listener)) listeners.add(listener); }
     public void remove(Listener listener) { listeners.remove(listener); }
     public void emit(boolean settingsChanged) { availableCache = null; offlineCache = null; for (Listener listener : new ArrayList<>(listeners)) listener.changed(settingsChanged); }
+    private void emitProgress() { for (Listener listener : new ArrayList<>(listeners)) listener.progressChanged(); }
     public Song song(String key) {
         Song song = songs.get(key);
         if (song == null && key != null) for (Song original : songs.values()) {
@@ -185,10 +195,10 @@ public final class Repository {
     private void reconcileCatalog(List<Song> incoming, String server) {
         Set<String> present = new HashSet<>(); for (Song song : incoming) present.add(song.remoteId);
         List<Song> removed = new ArrayList<>(); Set<String> stopping = new HashSet<>();
-        for (Song song : songs.values()) if (!song.sourceId(server).isEmpty() && !present.contains(song.sourceId(server))) { removed.add(song.copy()); if (!song.local()) stopping.add(song.key); }
+        for (Song song : songs.values()) if (!song.sourceId(server).isEmpty() && !present.contains(song.sourceId(server))) { removed.add(song.copy()); stopping.add(Core.songKey(server, song.sourceId(server))); if (!song.local()) stopping.add(song.key); }
         if (removed.isEmpty()) { merge(incoming, true); return; }
         storageBusy = true;
-        drain(stopping, () -> {
+        drain(stopping, false, () -> {
             try {
                 for (Song song : removed) {
                     deleteCloudOrphans(server, song.sourceId(server));
@@ -209,6 +219,74 @@ public final class Repository {
         if (lists != null) lists.replaceAll(list -> list.without(remoteId));
         save();
     }
+    private static final class InvalidLocalSong {
+        final String key; final File file; final long size, modified; final boolean missing;
+        InvalidLocalSong(Song song, File file, boolean missing) { this.key = song.key; this.file = file; this.missing = missing; size = file.length(); modified = file.lastModified(); }
+        boolean unchanged() {
+            if (missing) return file.getParentFile().isDirectory() && file.getParentFile().canRead() && Files.notExists(file.toPath());
+            return file.isFile() && file.canRead() && file.length() == size && file.lastModified() == modified;
+        }
+    }
+    private InvalidLocalSong invalidLocalSong(Song song) {
+        File file = audio(song);
+        if (!file.exists()) {
+            InvalidLocalSong candidate = new InvalidLocalSong(song, file, true);
+            return candidate.unchanged() ? candidate : null;
+        }
+        if (!file.isFile() || !file.canRead()) return null;
+        InvalidLocalSong candidate = new InvalidLocalSong(song, file, false);
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (InputStream in = new FileInputStream(file)) {
+                byte[] buffer = new byte[32768]; int count;
+                while ((count = in.read(buffer)) != -1) { if (Thread.currentThread().isInterrupted()) return null; digest.update(buffer, 0, count); }
+            }
+            if (!candidate.unchanged()) return null;
+            if (file.length() != song.size || !Core.hex(digest.digest()).equals(song.sha256)) return candidate;
+            MediaExtractor extractor = new MediaExtractor();
+            try {
+                extractor.setDataSource(file.getAbsolutePath());
+                for (int i = 0; i < extractor.getTrackCount(); i++) {
+                    String type = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME);
+                    if (type != null && type.startsWith("audio/")) return null;
+                }
+                return candidate.unchanged() ? candidate : null;
+            } finally { extractor.release(); }
+        } catch (Exception error) { return null; }
+    }
+    public void checkInvalidSongs() {
+        if (checkingInvalidSongs || storageBusy) return;
+        checkingInvalidSongs = true; status = "正在检测无效歌曲…"; emitProgress();
+        List<Song> snapshot = new ArrayList<>(); for (Song song : songs.values()) if (song.local()) snapshot.add(song.copy());
+        network.submit(() -> {
+            List<InvalidLocalSong> found = new ArrayList<>();
+            for (Song song : snapshot) { if (Thread.currentThread().isInterrupted()) return; InvalidLocalSong candidate = invalidLocalSong(song); if (candidate != null) found.add(candidate); }
+            main.post(() -> {
+                if (storageBusy) { checkingInvalidSongs = false; status = "当前正在处理歌曲，请稍后重新检测"; emitProgress(); return; }
+                Set<String> stopping = new HashSet<>();
+                for (InvalidLocalSong candidate : found) { Song song = songs.get(candidate.key); if (song != null && song.local() && audio(song).equals(candidate.file) && candidate.unchanged()) stopping.add(song.key); }
+                if (stopping.isEmpty()) { checkingInvalidSongs = false; status = "检测完成：未发现可确认无效的歌曲，无法读取的文件已跳过"; emitProgress(); return; }
+                startStorageChange();
+                drain(stopping, false, () -> {
+                    int removed = 0, linked = 0, failed = 0;
+                    for (InvalidLocalSong candidate : found) {
+                        Song song = songs.get(candidate.key);
+                        if (song == null || !song.local() || !audio(song).equals(candidate.file) || !candidate.unchanged()) continue;
+                        try {
+                            deleteFiles(song);
+                            if (song.hasCloud()) {
+                                Song remote = song.copy(); Map.Entry<String, String> link = song.cloudIds.entrySet().iterator().next();
+                                remote.server = link.getKey(); remote.remoteId = link.getValue(); remote.cloudIds.remove(link.getKey()); songs.put(song.key, remote); linked++;
+                            } else { forget(song.key, song.server, song.remoteId); removed++; }
+                        } catch (IOException error) { failed++; }
+                    }
+                    checkingInvalidSongs = false; storageBusy = false;
+                    status = "检测完成：已移除 " + removed + " 首无效歌曲，保留 " + linked + " 首的云端副本" + (failed > 0 ? "，" + failed + " 首清理失败" : "");
+                    save(); emit(false);
+                });
+            });
+        });
+    }
     public void deleteSong(Song selected, boolean cloud) {
         if (storageBusy) return;
         final ApiClient.Connection connection;
@@ -221,7 +299,8 @@ public final class Repository {
                     String remoteId = selected.sourceId(connection.server);
                     List<Song> affected = new ArrayList<>(); Set<String> stopping = new HashSet<>();
                     for (Song item : songs.values()) if (cloud ? item.sourceId(connection.server).equals(remoteId) : item.key.equals(selected.key)) { affected.add(item.copy()); if (!cloud || !item.local()) stopping.add(item.key); }
-                    drain(stopping, () -> {
+                    if (cloud) stopping.add(Core.songKey(connection.server, remoteId));
+                    drain(stopping, false, () -> {
                         try {
                             for (Song item : affected) {
                                 Song song = songs.get(item.key); if (song == null) continue;
@@ -243,8 +322,32 @@ public final class Repository {
             } catch (Exception error) { main.post(() -> { storageBusy = false; status = "删除未完成：" + ApiClient.message(error); emit(false); }); }
         });
     }
+    private CompletableFuture<String> uploadSongShared(ApiClient.Connection connection, Song song, int number, int total, int generation) {
+        String remoteId = song.sourceId(connection.server);
+        if (!remoteId.isEmpty()) return CompletableFuture.completedFuture(remoteId);
+        String key = connection.server + "|" + song.key;
+        CompletableFuture<String> existing = songUploads.get(key);
+        if (existing != null) return existing;
+        CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
+            try {
+                int[] last = {-1}; long[] lastUpdate = {0};
+                Song uploaded = api.upload(connection, song, audio(song), sent -> {
+                    int percent = (int)Math.min(100, sent * 100 / Math.max(1, song.size));
+                    long now = SystemClock.elapsedRealtime();
+                    if (percent == last[0] || (percent < 100 && now - lastUpdate[0] < 100)) return;
+                    last[0] = percent; lastUpdate[0] = now;
+                    main.post(() -> { if (generation == uploadGeneration && uploading) { uploadPercent = percent; status = percent == 100 ? "已发送 " + number + " / " + total + "：" + song.title + "，等待服务器处理…" : "上传 " + number + " / " + total + "：" + song.title + " · " + percent + "%"; emitProgress(); } });
+                });
+                main.post(() -> linkOriginal(song.key, connection.server, uploaded.remoteId));
+                return uploaded.remoteId;
+            } catch (Exception error) { throw new CompletionException(error); }
+        }, uploadWorkers);
+        songUploads.put(key, future);
+        future.whenComplete((value, error) -> main.post(() -> songUploads.remove(key, future)));
+        return future;
+    }
     public void uploadToCloud(String key, String playlistId) {
-        if (storageBusy) return;
+        if (storageBusy && !uploading) return;
         final ApiClient.Connection connection;
         try { connection = connection(); } catch (Exception error) { status = "请重新设置访问令牌"; emit(false); return; }
         Playlist list = playlistId == null ? null : playlist(playlistId);
@@ -252,27 +355,26 @@ public final class Repository {
         if (list != null) { for (String id : list.keys) { Song song = song(id); if (song != null) selected.add(song); } }
         else if (song(key) != null) selected.add(song(key));
         if (list == null && selected.isEmpty()) return;
-        startStorageChange(); status = "正在上传云端…"; emit(false);
+        if (activeUploads++ == 0) startStorageChange();
+        uploading = true; status = "正在上传云端…"; uploadPercent = 0; final int generation = ++uploadGeneration; emit(false);
         final String name = list == null ? "" : list.name, id = list == null ? "" : list.id;
-        network.submit(() -> {
+        List<CompletableFuture<String>> futures = new ArrayList<>();
+        for (int i = 0; i < selected.size(); i++) futures.add(uploadSongShared(connection, selected.get(i), i + 1, selected.size(), generation));
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).thenApplyAsync(ignored -> {
+            if (list == null) return null;
             try {
                 List<String> ids = new ArrayList<>();
-                for (Song song : selected) {
-                    String remoteId = song.sourceId(connection.server);
-                    if (remoteId.isEmpty()) {
-                        Song uploaded = api.upload(connection, song, audio(song)); remoteId = uploaded.remoteId;
-                        final String linked = remoteId;
-                        main.post(() -> linkOriginal(song.key, connection.server, linked));
-                    }
-                    ids.add(remoteId);
-                }
-                OnlinePlaylist uploaded = list == null ? null : api.uploadPlaylist(connection, id, name, ids);
-                main.post(() -> {
-                    if (uploaded != null) { List<OnlinePlaylist> values = onlinePlaylists(); values.removeIf(value -> value.id.equals(uploaded.id)); values.add(uploaded); mergeOnlinePlaylists(connection.server, values); }
-                    storageBusy = false; status = uploaded == null ? "歌曲已上传云端" : "歌单已按本地顺序上传云端"; save(); emit(false); refresh();
-                });
-            } catch (Exception error) { main.post(() -> { storageBusy = false; status = "上传未完成：" + ApiClient.message(error) + " 已上传的歌曲会保留，再次上传可继续。"; emit(false); }); }
-        });
+                for (CompletableFuture<String> future : futures) ids.add(future.join());
+                return api.uploadPlaylist(connection, id, name, ids);
+            } catch (Exception error) { throw new CompletionException(error); }
+        }, uploadWorkers).whenComplete((uploaded, error) -> main.post(() -> {
+            if (uploaded != null) { List<OnlinePlaylist> values = onlinePlaylists(); values.removeIf(value -> value.id.equals(uploaded.id)); values.add(uploaded); mergeOnlinePlaylists(connection.server, values); }
+            activeUploads--;
+            if (activeUploads == 0) { uploadGeneration++; uploadPercent = -1; storageBusy = false; uploading = false; }
+            Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+            status = cause == null ? (uploaded == null ? "歌曲已上传云端" : "歌单已按本地顺序上传云端") : "上传未完成：" + ApiClient.message(cause instanceof Exception ? (Exception) cause : new Exception(cause)) + " 已上传的歌曲会保留，再次上传可继续。";
+            save(); emit(false); if (activeUploads == 0) refresh();
+        }));
     }
     public void playbackRequestFailed(Exception error) {
         String detail = ApiClient.message(error);
@@ -305,7 +407,7 @@ public final class Repository {
         if (storageBusy || importing) { status = "请等待当前上传或导入完成"; emit(false); return; }
         startStorageChange();
         Set<String> stopping = new HashSet<>(); for (Song song : songs.values()) if (!song.local()) stopping.add(song.key);
-        drain(stopping, () -> {
+        drain(stopping, true, () -> {
             try {
                 // Include orphaned downloads while preserving every private local import.
                 Set<String> keep = new HashSet<>(); for (Song song : songs.values()) if (song.local()) { keep.add(audio(song).getName()); keep.add(artwork(song).getName()); }

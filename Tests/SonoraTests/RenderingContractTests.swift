@@ -99,6 +99,19 @@ struct RenderingContractTests {
         progressSubscription.cancel()
         print("PASS: download progress isolation and stale-value guards")
 
+        var storagePageUpdates = 0
+        var storageProgressUpdates = 0
+        let storagePageSubscription = model.objectWillChange.sink { storagePageUpdates += 1 }
+        let storageProgressSubscription = model.storageProgress.objectWillChange.sink { storageProgressUpdates += 1 }
+        for percent in 0...100 {
+            model.storageProgress.fraction = Double(percent) / 100
+            model.storageProgress.message = "上传 \(percent)%"
+        }
+        expect(storagePageUpdates == 0 && storageProgressUpdates == 202, "upload progress must not invalidate the whole library")
+        storagePageSubscription.cancel()
+        storageProgressSubscription.cancel()
+        print("PASS: upload progress isolation")
+
         let mini = NSSize(width: 380, height: 124)
         let full = NSSize(width: 980, height: 700)
         let unlimited = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)

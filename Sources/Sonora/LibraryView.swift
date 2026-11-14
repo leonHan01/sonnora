@@ -127,7 +127,9 @@ struct LibraryPage: View, Equatable {
                 }
                 Text("THE SOUND OF YOUR EVERYDAY").font(.system(size: 8, weight: .medium, design: .monospaced)).tracking(2.2).foregroundStyle(Theme.accent)
                 Text(model.sectionTitle).font(.system(size: 32, weight: .semibold)).lineLimit(1)
-                Text(model.sectionSubtitle).font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                if model.section != .all {
+                    Text(model.sectionSubtitle).font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                }
                 if model.isOnlinePlaylistSection && model.sectionTracks.isEmpty {
                     Text(model.isOnline ? "这张在线歌单还没有可播放的歌曲，请在管理页添加。" : "这张歌单还没有已缓存歌曲，请连接服务器后收听。")
                         .font(.system(size: 11)).foregroundStyle(Theme.secondary)
@@ -159,9 +161,14 @@ struct LibraryPage: View, Equatable {
                     .buttonStyle(QuietButtonStyle())
                     .disabled(model.currentTrack == nil)
                     .help("定位当前歌曲（⌘J）")
+                if model.section == .all {
+                    Button { Task { await model.checkInvalidSongs() } } label: {
+                        Label(model.isCheckingInvalidSongs ? "检测中…" : "检测无效歌曲", systemImage: "checkmark.shield")
+                    }.buttonStyle(QuietButtonStyle()).disabled(model.isCheckingInvalidSongs || model.isManagingStorage)
+                }
                 if case .playlist(let id) = model.section {
                     Button { Task { await model.uploadToCloud(playlistID: id) } } label: { Label("上传云端", systemImage: "icloud.and.arrow.up") }
-                        .buttonStyle(QuietButtonStyle()).disabled(model.isManagingStorage)
+                        .buttonStyle(QuietButtonStyle()).disabled(model.isManagingStorage && !model.isUploading)
                 }
                 Spacer()
                 if !model.search.isEmpty {
@@ -179,9 +186,9 @@ struct LibraryPage: View, Equatable {
                 }
             }.padding(.horizontal, 30).padding(.top, 10).padding(.bottom, 12)
             HStack(spacing: 14) {
-                Text("#").frame(width: 26, alignment: .center)
+                Text("#").frame(width: 48, alignment: .center)
                 Text("歌曲 / 艺术家").frame(maxWidth: .infinity, alignment: .leading)
-                Color.clear.frame(width: 62, height: 1)
+                Color.clear.frame(width: 94, height: 1)
                 if showAlbum { Text("专辑").frame(width: 125, alignment: .leading) }
                 Text("播放次数").frame(width: 64, alignment: .trailing)
                 Text("时长").frame(width: 44, alignment: .trailing)
@@ -404,18 +411,21 @@ struct TrackList: View {
 
     var body: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 3) {
+            List {
                     ForEach(NumberedTracks(tracks: model.visibleTracks)) { row in
                         TrackRow(model: model, track: row.track, number: row.index + 1,
                                  showAlbum: showAlbum, current: model.queue.currentID == row.id,
                                  selected: selection.id == row.id,
                                  playing: model.queue.currentID == row.id && model.isPlaying,
-                                 playlistID: playlistID, localCopy: row.track.hasLocalCopy, busy: model.isManagingStorage)
+                                 playlistID: playlistID, localCopy: row.track.hasLocalCopy, busy: model.isManagingStorage, uploadBusy: model.isManagingStorage && !model.isUploading)
                             .equatable().id(row.id)
+                            .listRowInsets(EdgeInsets(top: 1.5, leading: 22, bottom: 1.5, trailing: 22))
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
                     }
-                }.padding(.horizontal, 22).padding(.vertical, 6)
             }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
             // Ordinary selection leaves the user's scroll position alone.
             // Only an explicit locate request scrolls the library.
             .task(id: model.trackRevealRequest) {
@@ -450,13 +460,14 @@ struct TrackRow: View, Equatable {
     var playlistID: UUID?
     var localCopy = false
     var busy = false
+    var uploadBusy = false
     @LocalState private var hovering = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.model === rhs.model && lhs.track == rhs.track && lhs.number == rhs.number
             && lhs.showAlbum == rhs.showAlbum && lhs.current == rhs.current
             && lhs.selected == rhs.selected && lhs.playing == rhs.playing
-            && lhs.playlistID == rhs.playlistID && lhs.localCopy == rhs.localCopy && lhs.busy == rhs.busy
+            && lhs.playlistID == rhs.playlistID && lhs.localCopy == rhs.localCopy && lhs.busy == rhs.busy && lhs.uploadBusy == rhs.uploadBusy
     }
 
     var body: some View {
@@ -467,8 +478,8 @@ struct TrackRow: View, Equatable {
                 } else if hovering {
                     Button { play() } label: { Image(systemName: "play.fill").font(.system(size: 14)).foregroundStyle(Theme.text) }
                         .buttonStyle(.plain).help("播放《\(track.title)》")
-                } else { Text(String(format: "%02d", number)).font(.system(size: 12, design: .monospaced)).foregroundStyle(Theme.secondary.opacity(0.6)) }
-            }.frame(width: 26)
+                } else { Text(String(format: "%02d", number)).font(.system(size: 12, design: .monospaced)).foregroundStyle(Theme.secondary.opacity(0.6)).lineLimit(1).minimumScaleFactor(0.5) }
+            }.frame(width: 48)
             HStack(spacing: 12) {
                 ArtworkView(track: track, size: 52, radius: 8)
                 VStack(alignment: .leading, spacing: 7) {
@@ -487,12 +498,15 @@ struct TrackRow: View, Equatable {
                 Spacer(minLength: 0)
             }.frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 2) {
+                if track.remoteSource == nil {
+                    IconButton(symbol: "icloud.and.arrow.up", help: "上传云端", size: 13) { Task { await model.uploadToCloud(trackID: track.id) } }.disabled(uploadBusy)
+                } else { Color.clear.frame(width: 30, height: 30) }
                 IconButton(symbol: track.isFavorite ? "heart.fill" : "heart", help: track.isFavorite ? "取消收藏" : "收藏歌曲", color: track.isFavorite ? Theme.accent : Theme.secondary.opacity(hovering ? 0.9 : 0.35), size: 15) {
                     model.toggleFavorite(track.id)
                 }
                 PlaylistAddMenu(model: model, track: track)
             }
-            .frame(width: 62)
+            .frame(width: 94)
             if showAlbum { Text(track.album).font(.system(size: 12)).foregroundStyle(Theme.secondary).lineLimit(1).frame(width: 125, alignment: .leading) }
             Text("\(track.playCount)").font(.system(size: 12, design: .monospaced)).foregroundStyle(Theme.secondary)
                 .frame(width: 64, alignment: .trailing).help("已播放 \(track.playCount) 次")
@@ -527,7 +541,7 @@ struct TrackRow: View, Equatable {
         Button("在 Finder 中显示", systemImage: "folder") { model.reveal(track) }
             .disabled(track.remoteSource != nil && !FileManager.default.fileExists(atPath: track.url.path))
         if track.remoteSource == nil {
-            Button("一键上传云端", systemImage: "icloud.and.arrow.up") { Task { await model.uploadToCloud(trackID: track.id) } }.disabled(busy)
+            Button("一键上传云端", systemImage: "icloud.and.arrow.up") { Task { await model.uploadToCloud(trackID: track.id) } }.disabled(uploadBusy)
             Button("从曲库移除（保留文件）") { model.removeFromLibrary(track.id) }.disabled(busy)
         }
         Button("删除歌曲…", systemImage: "trash", role: .destructive) { model.deletionTrack = track }.disabled(busy)

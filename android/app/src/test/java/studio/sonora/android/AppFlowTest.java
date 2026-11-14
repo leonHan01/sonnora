@@ -77,6 +77,46 @@ public class AppFlowTest {
         assertTrue(repo.available().isEmpty()); assertTrue(repo.song(song.key).favorite); assertTrue(repo.playlist(list.id).keys.contains(song.key));
         repo.merge(Collections.singletonList(song), true); assertEquals(1, repo.available().size());
     }
+    private void awaitInvalidScan() throws Exception {
+        for (int i = 0; i < 500 && repo.checkingInvalidSongs; i++) { Thread.sleep(10); Shadows.shadowOf(Looper.getMainLooper()).idle(); }
+        assertFalse("Invalid song scan completes", repo.checkingInvalidSongs);
+    }
+    @Test public void invalidLocalSongsAreRemovedWithoutTouchingCloudSongsOrPlaylists() throws Exception {
+        Song remote = fixture();
+        Song missing = remote.copy(); missing.key = "local-" + missing.sha256; missing.server = ""; missing.remoteId = "";
+        repo.merge(Collections.singletonList(missing), false);
+        Repository.Playlist list = repo.createPlaylist("Keep cloud"); repo.addToPlaylist(missing.key, list.id); repo.addToPlaylist(remote.key, list.id);
+        repo.playback(missing.key, 0, Arrays.asList(missing.key, remote.key));
+        repo.checkInvalidSongs(); awaitInvalidScan();
+        assertNull(repo.song(missing.key)); assertNotNull(repo.song(remote.key));
+        assertEquals(Collections.singletonList(remote.key), list.keys); assertEquals(Collections.singletonList(remote.key), repo.lastQueue);
+        repo.disk.submit(() -> {}).get(5, TimeUnit.SECONDS);
+        Repository restored = new Repository(repo.context);
+        try { assertNull(restored.song(missing.key)); assertNotNull(restored.song(remote.key)); } finally { restored.network.shutdownNow(); restored.disk.shutdownNow(); }
+    }
+    @Test public void corruptLocalCopyKeepsCloudLinkFavoriteAndPlaylist() throws Exception {
+        Song remote = fixture();
+        Song local = remote.copy(); local.key = "local-" + local.sha256; local.server = ""; local.remoteId = "";
+        local.cloudIds.put(remote.server, remote.remoteId); repo.merge(Collections.singletonList(local), false);
+        java.nio.file.Files.write(repo.audio(local).toPath(), "changed".getBytes(StandardCharsets.UTF_8));
+        repo.toggleFavorite(local.key); Repository.Playlist list = repo.createPlaylist("Keep link"); repo.addToPlaylist(local.key, list.id);
+        repo.checkInvalidSongs(); awaitInvalidScan();
+        Song retained = repo.song(local.key); assertNotNull(retained); assertFalse(retained.local()); assertTrue(retained.favorite);
+        assertEquals(remote.remoteId, retained.sourceId(remote.server)); assertEquals(Collections.singletonList(local.key), list.keys);
+        assertFalse(repo.audio(local).exists());
+    }
+    @Test public void scanDoesNotRemoveAFileRestoredBeforeCleanup() throws Exception {
+        Song remote = fixture(); Song local = remote.copy(); local.key = "local-" + local.sha256; local.server = ""; local.remoteId = "";
+        repo.merge(Collections.singletonList(local), false);
+        final Runnable[] finish = new Runnable[1];
+        repo.storageCleaner = (stopping, all, completion) -> finish[0] = completion;
+        repo.checkInvalidSongs();
+        for (int i = 0; i < 500 && finish[0] == null; i++) { Thread.sleep(10); Shadows.shadowOf(Looper.getMainLooper()).idle(); }
+        assertNotNull(finish[0]);
+        java.nio.file.Files.write(repo.audio(local).toPath(), "fixture".getBytes(StandardCharsets.UTF_8));
+        finish[0].run();
+        assertNotNull(repo.song(local.key)); assertTrue(repo.audio(local).exists()); assertFalse(repo.checkingInvalidSongs);
+    }
     @Test public void clearingServerCacheKeepsImportedMusicFavoritesAndPlaylistReferences() throws Exception {
         Song remote = fixture(), local = remote.copy(); local.server = ""; local.remoteId = ""; local.key = "local-" + local.sha256;
         repo.merge(Collections.singletonList(local), false);
@@ -204,6 +244,31 @@ public class AppFlowTest {
                 assertEquals(server.id, client.radio(settings, server.id).remoteId); assertEquals("/api/music/tracks/radio?exclude=" + server.id, server.lastPath);
                 File destination = new File(repo.context.getFilesDir(), "http-test.mp3"); client.download(settings, songs.get(0), destination, null);
                 assertArrayEquals(server.audio, java.nio.file.Files.readAllBytes(destination.toPath())); assertTrue(destination.delete());
+                byte[] ranged = new byte[7]; assertEquals(7, client.readRange(settings, songs.get(0), 3, ranged, 0, ranged.length));
+                assertArrayEquals(Arrays.copyOfRange(server.audio, 3, 10), ranged);
+                try { client.readRange(new ApiClient.Connection(server.base, "wrong", 0), songs.get(0), 0, ranged, 0, 7); fail("Range must require a token"); }
+                catch (ApiClient.Failure expected) { assertEquals(401, expected.status); }
+                server.redirectAudio = true;
+                try { client.readRange(settings, songs.get(0), 0, ranged, 0, 7); fail("Range redirects must be rejected"); }
+                catch (ApiClient.Failure expected) { assertEquals(0, server.leaked); }
+                server.redirectAudio = false;
+                File streamed = new File(repo.context.getFilesDir(), "progressive-test.mp3");
+                try (ProgressiveCache cache = new ProgressiveCache(streamed, songs.get(0).size, songs.get(0).sha256)) {
+                    client.downloadProgressively(settings, songs.get(0), cache, null);
+                    assertArrayEquals(server.audio, java.nio.file.Files.readAllBytes(streamed.toPath()));
+                }
+                assertTrue(streamed.delete());
+                server.slowAudio = true;
+                ExecutorService downloader = Executors.newSingleThreadExecutor(); CountDownLatch firstBytes = new CountDownLatch(1);
+                try (ProgressiveCache cache = new ProgressiveCache(streamed, songs.get(0).size, songs.get(0).sha256)) {
+                    Future<?> loading = downloader.submit(() -> { try { client.downloadProgressively(settings, songs.get(0), cache, bytes -> firstBytes.countDown()); } catch (IOException error) { throw new UncheckedIOException(error); } });
+                    assertTrue(firstBytes.await(3, TimeUnit.SECONDS));
+                    byte[] early = new byte[4]; assertEquals(4, cache.readAt(0, early, 0, 4));
+                    assertFalse("Audio bytes are readable while the authenticated download is still running", loading.isDone());
+                    assertFalse("Incomplete audio is not advertised as an offline cache", streamed.exists());
+                    loading.get(3, TimeUnit.SECONDS); assertArrayEquals(server.audio, java.nio.file.Files.readAllBytes(streamed.toPath()));
+                } finally { downloader.shutdownNow(); server.slowAudio = false; }
+                assertTrue(streamed.delete());
                 server.empty = true; assertNull(client.radio(settings, null)); server.empty = false;
                 try { client.list(new ApiClient.Connection(server.base, "wrong", 0)); fail("Wrong token should fail"); } catch (ApiClient.Failure expected) { assertTrue(expected.getMessage().contains("认证")); }
                 server.redirect = true;
@@ -235,6 +300,33 @@ public class AppFlowTest {
             try { assertEquals(server.id, restored.song(local.key).sourceId(server.base)); } finally { restored.network.shutdownNow(); restored.disk.shutdownNow(); }
         }
     }
+    @Test public void uploadShowsProgressAndDoesNotBlockChangingSongs() throws Exception {
+        try (HttpFixture server = new HttpFixture()) {
+            server.allowAnonymous = true; server.slowUpload = true; repo.credentials.save(server.base, false, "", false);
+            Song first = Song.remote(new org.json.JSONObject(server.json), server.base); first.server = ""; first.remoteId = ""; first.key = "local-" + first.sha256;
+            Song second = fixture();
+            repo.merge(Collections.singletonList(first), false); java.nio.file.Files.write(repo.audio(first).toPath(), server.audio);
+            ServiceController<PlaybackService> controller = Robolectric.buildService(PlaybackService.class).create(); PlaybackService service = controller.get();
+            try {
+                repo.uploadToCloud(first.key, null);
+                final int[] catalogChanges = {0}, progressChanges = {0};
+                Repository.Listener observer = new Repository.Listener() {
+                    @Override public void changed(boolean settingsChanged) { catalogChanges[0]++; }
+                    @Override public void progressChanged() { progressChanges[0]++; }
+                };
+                repo.observe(observer);
+                for (int i = 0; i < 100 && repo.uploadPercent < 100; i++) { Thread.sleep(10); Shadows.shadowOf(Looper.getMainLooper()).idle(); }
+                assertTrue(repo.uploading); assertEquals(100, repo.uploadPercent); assertTrue(repo.status.contains("等待服务器处理"));
+                assertTrue("Progress updates must reach the UI", progressChanges[0] > 0);
+                assertEquals("Progress alone must not rebuild the catalog", 0, catalogChanges[0]);
+                repo.remove(observer);
+                service.onStartCommand(new Intent(repo.context, PlaybackService.class).setAction(PlaybackService.PLAY).putExtra("key", first.key).putStringArrayListExtra("queue", new ArrayList<>(Arrays.asList(first.key, second.key))), 0, 1);
+                service.onStartCommand(new Intent(repo.context, PlaybackService.class).setAction(PlaybackService.NEXT), 0, 2);
+                assertEquals("Uploading must not block next song", second.key, service.currentKey);
+                awaitStorage(); assertEquals(-1, repo.uploadPercent); assertFalse(repo.uploading);
+            } finally { controller.destroy(); }
+        }
+    }
     @Test public void deletionFailureRetainsCacheAndSuccessCleansAllReferences() throws Exception {
         try (HttpFixture server = new HttpFixture()) {
             server.allowAnonymous = true; repo.credentials.save(server.base, false, "", false);
@@ -255,7 +347,7 @@ public class AppFlowTest {
     }
     @Test public void clearingCacheWaitsForCancelledWriterAndPreservesImportedOriginal() throws Exception {
         Song remote = fixture(); final Runnable[] finish = new Runnable[1];
-        repo.storageCleaner = (stopping, completion) -> { assertTrue(stopping.contains(remote.key)); finish[0] = completion; };
+        repo.storageCleaner = (stopping, allCaches, completion) -> { assertTrue(allCaches); assertTrue(stopping.contains(remote.key)); finish[0] = completion; };
         repo.clearDownloaded(); assertTrue(repo.storageBusy); assertTrue(repo.audio(remote).exists());
         java.nio.file.Files.write(repo.audio(remote).toPath(), "late writer".getBytes(StandardCharsets.UTF_8));
         finish[0].run(); assertFalse(repo.storageBusy); assertFalse(repo.audio(remote).exists()); assertNotNull(repo.song(remote.key));
@@ -265,7 +357,7 @@ public class AppFlowTest {
         final String base, id = UUID.randomUUID().toString();
         final byte[] audio = "generated fixture bytes".getBytes(StandardCharsets.UTF_8);
         final String json;
-        volatile boolean redirect, empty, closed, playlistFailure, allowAnonymous, failDelete, emptyCatalog;
+        volatile boolean redirect, redirectAudio, slowAudio, slowUpload, empty, closed, playlistFailure, allowAnonymous, failDelete, emptyCatalog;
         volatile int uploads;
         volatile int leaked;
         volatile String lastPath;
@@ -283,9 +375,10 @@ public class AppFlowTest {
         private void serve(java.net.Socket socket) throws IOException {
             socket.setSoTimeout(3000); BufferedReader input = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
             String first = input.readLine(); if (first == null) return;
-            String method = first.split(" ")[0], path = first.split(" ")[1], authorization = ""; int length = 0; boolean chunked = false; lastPath = path;
+            String method = first.split(" ")[0], path = first.split(" ")[1], authorization = "", range = ""; int length = 0; boolean chunked = false; lastPath = path;
             String line; while ((line = input.readLine()) != null && !line.isEmpty()) {
                 String lower = line.toLowerCase(Locale.ROOT);
+                if (lower.startsWith("range:")) range = line.substring(line.indexOf(':') + 1).trim();
                 if (lower.startsWith("authorization:")) authorization = line.substring(line.indexOf(':') + 1).trim();
                 if (lower.startsWith("content-length:")) length = Integer.parseInt(line.substring(line.indexOf(':') + 1).trim());
                 if (lower.startsWith("transfer-encoding:") && lower.contains("chunked")) chunked = true;
@@ -296,6 +389,11 @@ public class AppFlowTest {
             int code = 200; String location = ""; byte[] body;
             if (path.startsWith("/should-not")) { leaked++; code = 500; body = new byte[0]; }
             else if (!authorization.equals("Bearer fixture-token") && !(allowAnonymous && authorization.isEmpty())) { code = 401; body = new byte[0]; }
+            else if (path.endsWith("/audio") && redirectAudio) { code = 302; location = "Location: " + base + "/should-not-be-requested\r\n"; body = new byte[0]; }
+            else if (path.endsWith("/audio") && !range.isEmpty()) {
+                String[] limits = range.substring("bytes=".length()).split("-"); int from = Integer.parseInt(limits[0]), to = Integer.parseInt(limits[1]);
+                code = 206; location = "Content-Range: bytes " + from + "-" + to + "/" + audio.length + "\r\n"; body = Arrays.copyOfRange(audio, from, to + 1);
+            }
             else if (method.equals("DELETE")) { code = failDelete ? 503 : 204; body = new byte[0]; }
             else if (method.equals("POST") && path.startsWith("/api/music/tracks?")) { uploads++; code = 201; body = json.getBytes(StandardCharsets.UTF_8); }
             else if (method.equals("POST") && path.equals("/api/music/playlists")) {
@@ -312,8 +410,17 @@ public class AppFlowTest {
             else if (path.equals("/api/music/playlists") && playlistFailure) { code = 405; body = new byte[0]; }
             else if (path.equals("/api/music/playlists")) body = ("[{\"id\":\"10000000-0000-0000-0000-000000000001\",\"name\":\"Shared\",\"trackIds\":[\"" + id + "\"]}]").getBytes(StandardCharsets.UTF_8);
             else body = path.endsWith("/audio") ? audio : (path.contains("/radio") ? json : "[" + json + "]").getBytes(StandardCharsets.UTF_8);
+            if (slowUpload && method.equals("POST") && path.startsWith("/api/music/tracks?")) {
+                try { Thread.sleep(500); } catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+            }
             String headers = "HTTP/1.1 " + code + " Test\r\nContent-Length: " + body.length + "\r\n" + location + "Connection: close\r\n\r\n";
-            OutputStream out = socket.getOutputStream(); out.write(headers.getBytes(StandardCharsets.US_ASCII)); out.write(body); out.flush();
+            OutputStream out = socket.getOutputStream(); out.write(headers.getBytes(StandardCharsets.US_ASCII));
+            if (slowAudio && path.endsWith("/audio") && range.isEmpty() && code == 200 && body.length > 4) {
+                out.write(body, 0, 4); out.flush();
+                try { Thread.sleep(500); } catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+                out.write(body, 4, body.length - 4);
+            } else out.write(body);
+            out.flush();
         }
         @Override public void close() throws IOException { closed = true; server.close(); }
     }

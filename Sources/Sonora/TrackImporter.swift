@@ -1,8 +1,46 @@
 import AppKit
 import AVFoundation
 
+struct InvalidTrackEvidence: Sendable {
+    let id: UUID
+    let url: URL
+    let size: UInt64?
+    let modified: Date?
+
+    static func missing(_ url: URL) -> Bool {
+        let parent = url.deletingLastPathComponent()
+        var directory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: parent.path, isDirectory: &directory), directory.boolValue,
+              FileManager.default.isReadableFile(atPath: parent.path) else { return false }
+        do { _ = try FileManager.default.attributesOfItem(atPath: url.path); return false }
+        catch let error as NSError {
+            return error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError
+                || error.domain == NSPOSIXErrorDomain && error.code == ENOENT
+        }
+    }
+
+    func stillMatches() -> Bool {
+        guard let size, let modified else { return Self.missing(url) }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else { return false }
+        return (attrs[.size] as? NSNumber)?.uint64Value == size && (attrs[.modificationDate] as? Date) == modified
+    }
+}
+
 enum TrackImporter {
     static let extensions: Set<String> = ["mp3", "m4a", "aac", "wav", "aif", "aiff", "caf", "flac"]
+
+    static func invalidEvidence(for track: Track) async -> InvalidTrackEvidence? {
+        guard track.remoteSource == nil, track.url.isFileURL else { return nil }
+        let manager = FileManager.default
+        guard let attrs = try? manager.attributesOfItem(atPath: track.url.path) else {
+            return InvalidTrackEvidence.missing(track.url) ? InvalidTrackEvidence(id: track.id, url: track.url, size: nil, modified: nil) : nil
+        }
+        guard attrs[.type] as? FileAttributeType == .typeRegular, manager.isReadableFile(atPath: track.url.path),
+              let size = (attrs[.size] as? NSNumber)?.uint64Value, let modified = attrs[.modificationDate] as? Date else { return nil }
+        let asset = AVURLAsset(url: track.url)
+        guard let playable = try? await asset.load(.isPlayable), !playable else { return nil }
+        return InvalidTrackEvidence(id: track.id, url: track.url, size: size, modified: modified)
+    }
 
     static func canonicalURL(_ url: URL) -> URL {
         url.standardizedFileURL.resolvingSymlinksInPath()

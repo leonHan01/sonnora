@@ -1,4 +1,17 @@
 import SwiftUI
+
+private struct StorageProgressBanner: View {
+    @ObservedObject var progress: StorageProgress
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if let fraction = progress.fraction { ProgressView(value: fraction).frame(width: 110) }
+            else { ProgressView().controlSize(.small) }
+            Text(progress.message).font(.system(size: 11)).lineLimit(2)
+            Spacer()
+        }.padding(12).foregroundStyle(Theme.accent).background(Theme.surface)
+    }
+}
 import Combine
 import UniformTypeIdentifiers
 
@@ -64,8 +77,8 @@ struct SonoraApp: App {
                 Button("关于声屿") {
                     NSApp.orderFrontStandardAboutPanel(options: [
                         .applicationName: "声屿 · Sonora",
-                        .applicationVersion: "1.6.0",
-                        .version: "27",
+                        .applicationVersion: "2.0.1",
+                        .version: "28",
                         .credits: NSAttributedString(string: "每一首喜欢，都有一座岛。\n原生 macOS 在线与离线音乐播放器")
                     ])
                 }
@@ -125,8 +138,7 @@ struct RootView: View {
                         }.foregroundStyle(Theme.accent).padding(.horizontal, 22).padding(.vertical, 10).background(Theme.surface)
                     }
                     if model.isManagingStorage {
-                        HStack { ProgressView().controlSize(.small); Text(model.storageMessage).font(.system(size: 11)); Spacer() }
-                            .padding(12).foregroundStyle(Theme.accent).background(Theme.surface)
+                        StorageProgressBanner(progress: model.storageProgress)
                     }
                     if model.isImporting {
                         HStack(spacing: 9) {

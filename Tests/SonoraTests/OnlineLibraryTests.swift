@@ -129,8 +129,18 @@ private final class ProgressServer: @unchecked Sendable {
             return
         }
         let audio = path.hasSuffix("/audio")
-        let body = audio ? bytes : (path == "/api/music/tracks" ? catalog : Data("[]".utf8))
-        let header = Data("HTTP/1.1 200 OK\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
+        let requestText = String(decoding: request, as: UTF8.self)
+        let rangeLine = requestText.components(separatedBy: "\r\n").first { $0.lowercased().hasPrefix("range: bytes=") }
+        var body = audio ? bytes : (path == "/api/music/tracks" ? catalog : Data("[]".utf8))
+        var rangeHeader = "", status = "200 OK"
+        if audio, let rangeLine {
+            let parts = rangeLine.components(separatedBy: "=").last!.split(separator: "-")
+            if parts.count == 2, let start = Int(parts[0]), let end = Int(parts[1]), start >= 0, end >= start, end < bytes.count {
+                body = bytes.subdata(in: start..<(end + 1)); status = "206 Partial Content"
+                rangeHeader = "Content-Range: bytes \(start)-\(end)/\(bytes.count)\r\n"
+            }
+        }
+        let header = Data("HTTP/1.1 \(status)\r\nContent-Length: \(body.count)\r\n\(rangeHeader)Connection: close\r\n\r\n".utf8)
         guard sendAll(header, to: connection) else { return }
         let chunkSize = audio ? 64 * 1024 : max(1, body.count)
         for offset in stride(from: 0, to: body.count, by: chunkSize) {
@@ -150,6 +160,48 @@ private final class ProgressServer: @unchecked Sendable {
             return true
         }
     }
+}
+
+// Slow loopback upload proves progress comes from the real URLSession transfer.
+private final class UploadProgressServer: @unchecked Sendable {
+    private let listener: Int32
+    private let reply: Data
+    private let lock = NSLock()
+    private var authorized = false
+    let url: URL
+    init(reply: Data) throws {
+        self.reply = reply
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw POSIXError(.EIO) }
+        var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET); address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        guard bound == 0, listen(fd, 2) == 0 else { close(fd); throw POSIXError(.EACCES) }
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) } }
+        listener = fd; url = URL(string: "http://127.0.0.1:\(UInt16(bigEndian: address.sin_port))")!
+        DispatchQueue.global().async { [weak self] in
+            let client = accept(fd, nil, nil); guard client >= 0, let self else { return }
+            defer { close(client) }
+            var input = Data(), buffer = [UInt8](repeating: 0, count: 16384)
+            while input.range(of: Data("\r\n\r\n".utf8)) == nil {
+                let count = recv(client, &buffer, buffer.count, 0); guard count > 0 else { return }; input.append(buffer, count: count)
+            }
+            guard let marker = input.range(of: Data("\r\n\r\n".utf8)) else { return }
+            let headers = String(decoding: input[..<marker.lowerBound], as: UTF8.self)
+            let lengthLine = headers.components(separatedBy: "\r\n").first { $0.lowercased().hasPrefix("content-length:") }
+            guard let lengthLine, let total = Int(lengthLine.split(separator: ":").last!.trimmingCharacters(in: .whitespaces)) else { return }
+            self.lock.lock(); self.authorized = headers.lowercased().contains("authorization: bearer fixture-token"); self.lock.unlock()
+            var received = input.count - marker.upperBound
+            while received < total {
+                let count = recv(client, &buffer, min(buffer.count, total - received), 0); guard count > 0 else { return }
+                received += count; Thread.sleep(forTimeInterval: 0.002)
+            }
+            var data = Data("HTTP/1.1 201 Created\r\nContent-Length: \(self.reply.count)\r\nConnection: close\r\n\r\n".utf8); data.append(self.reply)
+            _ = data.withUnsafeBytes { send(client, $0.baseAddress!, $0.count, 0) }
+        }
+    }
+    var receivedAuthorization: Bool { lock.lock(); defer { lock.unlock() }; return authorized }
+    deinit { shutdown(listener, SHUT_RDWR); close(listener) }
 }
 
 private final class RequestLog: @unchecked Sendable {
@@ -744,6 +796,33 @@ struct OnlineLibraryTests {
         try Data("fixture".utf8).write(to: remoteSong.url)
         try await maintenance.synchronizeCatalog([], server: targetServer)
         expect(maintenance.track(for: remoteSong.id) == nil && !remoteSong.hasLocalCopy, "authoritative catalog prunes deleted server song and cache")
+        // Uploading must not block transport commands or replace the selected song.
+        let switchingRoot = root.appendingPathComponent("upload-switch")
+        try FileManager.default.createDirectory(at: switchingRoot, withIntermediateDirectories: true)
+        let firstFile = switchingRoot.appendingPathComponent("first.mp3"), secondFile = switchingRoot.appendingPathComponent("second.mp3")
+        try Data("fixture".utf8).write(to: firstFile); try Data("fixture".utf8).write(to: secondFile)
+        let firstLocal = Track(url: firstFile, title: "First", artist: "Test", album: "Test", duration: 1)
+        let secondLocal = Track(url: secondFile, title: "Second", artist: "Test", album: "Test", duration: 1)
+        let switchingModel = PlayerModel(storageURL: switchingRoot.appendingPathComponent("library.json"), enableSystemControls: false, musicClient: client)
+        switchingModel.tracks = [firstLocal, secondLocal]
+        switchingModel.queue = PlaybackQueue(ids: [firstLocal.id, secondLocal.id])
+        StubProtocol.delay = { $0.httpMethod == "POST" ? 0.5 : 0 }
+        StubProtocol.respond = { _ in (201, uploadJSON) }
+        let uploading = Task { await switchingModel.uploadToCloud(trackID: firstLocal.id) }
+        try await settle { switchingModel.isUploading && switchingModel.uploadFraction != nil }
+        switchingModel.next()
+        expect(switchingModel.queue.currentID == secondLocal.id, "switching songs remains available during upload")
+        await uploading.value
+        expect(!switchingModel.isUploading && switchingModel.uploadFraction == nil, "upload completion clears progress")
+        StubProtocol.delay = { _ in 0 }
+        let uploadServer = try UploadProgressServer(reply: uploadJSON)
+        let largeUploadFile = root.appendingPathComponent("upload-progress.mp3")
+        try Data(repeating: 7, count: 6 * 1024 * 1024).write(to: largeUploadFile)
+        let uploadFixture = Track(url: largeUploadFile, title: "Progress", artist: "Test", album: "Test", duration: 1)
+        let uploadProgress = ProgressLog()
+        _ = try await OnlineMusicClient().upload(uploadFixture, server: uploadServer.url, token: "fixture-token") { uploadProgress.append($0) }
+        expect(uploadServer.receivedAuthorization, "upload progress preserves bearer authentication")
+        expect(uploadProgress.snapshot.contains { $0.receivedBytes > 0 } && uploadProgress.snapshot.last?.percentage == 100, "upload reports bytes sent through the real transfer")
         let listToUpload = Playlist(name: "Ordered upload", trackIDs: [])
         let firstCloudID = UUID(), secondCloudID = UUID()
         var finalOrder: [String] = []
@@ -763,6 +842,45 @@ struct OnlineLibraryTests {
         }
         let uploadedOrder = try await client.uploadPlaylist(listToUpload, trackIDs: [firstCloudID, secondCloudID], server: targetServer, token: "test-token")
         expect(uploadedOrder.trackIds == [firstCloudID, secondCloudID] && finalOrder == [firstCloudID.uuidString.lowercased(), secondCloudID.uuidString.lowercased()], "playlist upload preserves local order using compare-and-set reorder")
+        // A real MP3 with trailing padding makes the complete download slow
+        // while authenticated range reads can prepare playback immediately.
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Fixtures/silence.mp3")
+        let realAudio = try Data(contentsOf: fixture) + Data(repeating: 0, count: 2 * 1024 * 1024)
+        let realRecord = ServerTrack(id: UUID(), title: "Streaming fixture", artist: "Test", album: "Test", duration: 2,
+                                     extension: "mp3", sha256: SHA256.hash(data: realAudio).map { String(format: "%02x", $0) }.joined(), size: Int64(realAudio.count), uploadedAt: "2026-11-13T00:00:00Z")
+        let realServer = try ProgressServer(bytes: realAudio, catalog: try payload([realRecord]))
+        defer { realServer.stop() }
+        let realRoot = root.appendingPathComponent("real-stream")
+        try FileManager.default.createDirectory(at: realRoot, withIntermediateDirectories: true)
+        try JSONEncoder().encode(OnlineSettings(server: realServer.url.absoluteString)).write(to: realRoot.appendingPathComponent("online-settings.json"))
+        let realModel = PlayerModel(storageURL: realRoot.appendingPathComponent("library.json"), enableSystemControls: false, musicClient: OnlineMusicClient())
+        realModel.reconnect(); try await settle { !realModel.isConnecting }
+        let realTrack = try realRecord.track(server: realServer.url, cacheRoot: realModel.musicCacheURL)
+        realModel.playTrack(realTrack.id)
+        for _ in 0..<100 where !realModel.isPlaying { try await Task.sleep(for: .milliseconds(50)) }
+        expect(realModel.isPlaying && !realTrack.hasLocalCopy, "stream starts before full file is cached")
+        for _ in 0..<10 where realModel.elapsed < 0.05 { try await Task.sleep(for: .milliseconds(100)); realModel.tick() }
+        expect(realModel.elapsed >= 0.05 && !realTrack.hasLocalCopy, "audio playback advances while the complete file is still downloading")
+        let otherRecord = ServerTrack(id: UUID(), title: "Other", artist: "Test", album: "Test", duration: 2, extension: "mp3", sha256: realRecord.sha256, size: realRecord.size, uploadedAt: realRecord.uploadedAt)
+        realModel.tracks.append(try otherRecord.track(server: realServer.url, cacheRoot: realModel.musicCacheURL))
+        try await realModel.synchronizeCatalog([realTrack], server: realServer.url)
+        expect(realModel.isPlaying && !realTrack.hasLocalCopy, "removing an unrelated cloud song preserves current playback and download")
+        realModel.pause()
+        for _ in 0..<100 where !realTrack.hasLocalCopy { try await Task.sleep(for: .milliseconds(50)) }
+        expect(realTrack.hasLocalCopy, "background cache completes after pausing playback")
+        realModel.stop()
+        let selectedClient = OnlineMusicClient()
+        let selectedRoot = root.appendingPathComponent("selected-drain")
+        let selectedA = try realRecord.track(server: realServer.url, cacheRoot: selectedRoot)
+        let selectedB = try otherRecord.track(server: realServer.url, cacheRoot: selectedRoot)
+        let progressA = ProgressLog(), progressB = ProgressLog()
+        let taskA = Task { try await selectedClient.download(selectedA, token: "", onProgress: { progressA.append($0) }) }
+        let taskB = Task { try await selectedClient.download(selectedB, token: "", onProgress: { progressB.append($0) }) }
+        try await settle { (progressA.snapshot.last?.receivedBytes ?? 0) > 0 && (progressB.snapshot.last?.receivedBytes ?? 0) > 0 }
+        await selectedClient.cancelDownloads(urls: [selectedA.url])
+        _ = await taskA.result
+        try await taskB.value
+        expect(!selectedA.hasLocalCopy && selectedB.hasLocalCopy, "selective cache cleanup does not interrupt an unrelated download")
         let drainingModel = PlayerModel(storageURL: root.appendingPathComponent("draining/library.json"), enableSystemControls: false, musicClient: streamClient)
         let drainingSong = try progressRecords[0].track(server: progressServer.url, cacheRoot: drainingModel.musicCacheURL)
         drainingModel.tracks = [drainingSong]

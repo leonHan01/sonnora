@@ -54,6 +54,12 @@ final class PlaybackVolume: ObservableObject {
 }
 
 @MainActor
+final class StorageProgress: ObservableObject {
+    @Published var message = ""
+    @Published var fraction: Double?
+}
+
+@MainActor
 final class TrackSelection: ObservableObject {
     @Published fileprivate(set) var id: UUID?
 }
@@ -111,6 +117,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             guard value != playbackVolume.value else { return }
             playbackVolume.value = value
             audioPlayer?.volume = value
+            streamPlayer?.volume = value
             scheduleSave()
         }
     }
@@ -122,7 +129,22 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var playlistEditor: PlaylistEditor?
     @Published var deletionTrack: Track?
     @Published private(set) var isManagingStorage = false
-    @Published private(set) var storageMessage = ""
+    @Published private(set) var isUploading = false
+    @Published private(set) var isCheckingInvalidSongs = false
+    private var playbackBlockedByStorage: Bool { isManagingStorage && !isUploading }
+    let storageProgress = StorageProgress()
+    private var storageMessage: String {
+        get { storageProgress.message }
+        set { storageProgress.message = newValue }
+    }
+    var uploadFraction: Double? {
+        get { storageProgress.fraction }
+        set { storageProgress.fraction = newValue }
+    }
+    private var activeUploads = 0
+    private var songUploadTasks: [String: Task<UUID, Error>] = [:]
+    private var uploadAttempt = UUID()
+    private var uploadProgressSongID: UUID?
     @Published var showConnectionSettings = false
     @Published private(set) var onlineSettings = OnlineSettings()
     @Published private(set) var isOnline = false
@@ -161,6 +183,13 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private var availableTrackCache: [Track]?
 
     private var audioPlayer: AVAudioPlayer?
+    private var streamPlayer: AVPlayer?
+    private var streamLoader: MusicStreamingResource?
+    private var streamObservation: NSKeyValueObservation?
+    private var streamEndObserver: NSObjectProtocol?
+    private var streamWantsPlayback = false
+    private var backgroundCaches: [UUID: Task<Void, Never>] = [:]
+    private var backgroundCacheURLs: [UUID: URL] = [:]
     private let storageURL: URL
     private let libraryWriter: LibraryWriter
     private var saveRevision = 0
@@ -526,7 +555,9 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             guard !isManagingStorage else { throw CancellationError() }
             isManagingStorage = true
             defer { isManagingStorage = false }
-            await prepareStorageChange(stopping: Set(removed.filter { $0.remoteSource != nil }.map(\.id)), cancelConnection: false)
+            var stopping = Set(removed.filter { $0.remoteSource != nil }.map(\.id))
+            for song in removed { if let source = song.source(on: server) { stopping.insert(source.cacheID) } }
+            await prepareStorageChange(stopping: stopping, cancelConnection: false)
             for song in removed {
                 if let source = song.source(on: server) { try removeSourceCaches(source) }
                 if song.remoteSource != nil { try removeManagedCache(song); forgetTrack(song.id) }
@@ -576,7 +607,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func refreshUpcomingCache() {
-        guard !isManagingStorage, isPlaying, isOnline, loadingTrackID == nil, let currentID = queue.currentID,
+        guard !playbackBlockedByStorage, isPlaying, isOnline, loadingTrackID == nil, let currentID = queue.currentID,
               let server = try? OnlineSettings.serverURL(onlineSettings.server) else {
             cancelUpcomingCache()
             return
@@ -670,6 +701,15 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         downloadProgress.reset()
     }
 
+    private func endStreamPlayback() {
+        streamWantsPlayback = false
+        streamObservation?.invalidate(); streamObservation = nil
+        if let observer = streamEndObserver { NotificationCenter.default.removeObserver(observer); streamEndObserver = nil }
+        streamPlayer?.pause(); streamPlayer?.replaceCurrentItem(with: nil); streamPlayer = nil
+        streamLoader?.stop(); streamLoader = nil
+        loadingTrackID = nil; downloadProgress.reset()
+    }
+
     private func downloadForPlayback(_ track: Track, at position: Double) {
         guard isOnline, onlineIDs.contains(track.id), track.remoteSource?.server == configuredServer else {
             useOfflineMode(message: "连接不上服务器，当前使用离线模式。")
@@ -677,46 +717,57 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             if isRadioActive { playOfflineRadio() }
             return
         }
-        let attempt = UUID()
-        playbackAttempt = attempt
-        loadingTrackID = track.id
+        let attempt = UUID(); playbackAttempt = attempt; loadingTrackID = track.id; streamWantsPlayback = true
         downloadProgress.begin(track)
         let token = connectionToken
-        audioDownloadTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await musicClient.download(track, token: token) { [weak self] progress in
-                    Task { @MainActor [weak self] in
-                        guard let self, playbackAttempt == attempt, loadingTrackID == track.id else { return }
-                        downloadProgress.update(progress, for: track.id)
+        do {
+            let loader = try MusicStreamingResource(track: track, token: token, session: musicClient.session)
+            let item = AVPlayerItem(asset: loader.asset), player = AVPlayer(playerItem: item)
+            player.volume = volume; streamLoader = loader; streamPlayer = player
+            streamEndObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self, weak player] _ in
+                Task { @MainActor in guard let self, let player, self.streamPlayer === player else { return }; self.next(automatic: true) }
+            }
+            streamObservation = item.observe(\.status, options: [.initial, .new]) { [weak self, weak player] item, _ in
+                Task { @MainActor in
+                    guard let self, let player, self.streamPlayer === player, self.playbackAttempt == attempt else { return }
+                    if item.status == .readyToPlay {
+                        self.loadingTrackID = nil; self.downloadProgress.reset()
+                        let duration = item.duration.seconds
+                        if duration.isFinite && duration > 0 { self.playbackDuration = duration }
+                        if position > 0 { player.seek(to: CMTime(seconds: position, preferredTimescale: 600)) }
+                        if self.streamWantsPlayback { player.play(); self.playbackDidStart(successfully: true) }
+                        self.updateNowPlaying(); self.scheduleSave()
+                    } else if item.status == .failed {
+                        self.loadingTrackID = nil; self.downloadProgress.reset(); self.isPlaying = false
+                        self.showNotice("无法播放云端歌曲：" + (item.error?.localizedDescription ?? "请检查网络后重试。"), error: true)
+                        self.updateNowPlaying()
                     }
                 }
-                try Task.checkCancellation()
-                guard playbackAttempt == attempt, queue.currentID == track.id else { return }
-                downloadProgress.update(TrackDownloadProgress(receivedBytes: track.remoteSource?.size ?? 0,
-                                                              totalBytes: track.remoteSource?.size ?? 0, phase: .preparing), for: track.id)
-                let metadata = try await TrackImporter.read(track.url)
-                try Task.checkCancellation()
-                guard playbackAttempt == attempt, queue.currentID == track.id else { return }
-                applyDownloadedMetadata(metadata, to: track.id)
-                loadCurrent(autoplay: true, at: position)
-            } catch {
-                guard !Task.isCancelled, playbackAttempt == attempt else { return }
-                loadingTrackID = nil
-                downloadProgress.reset()
-                // Do not retain a corrupt/incomplete download as an offline song.
-                try? FileManager.default.removeItem(at: track.url)
-                let message = (error as? OnlineLibraryError)?.localizedDescription ?? "歌曲下载或解析失败，请重试或换一首。"
-                if OnlineLibraryError.requiresOfflineMode(error) { useOfflineMode(message: message + " 当前使用离线模式。") }
-                else { connectionMessage = message }
-                showNotice("无法播放《\(track.title)》：" + message, error: true)
-                if isRadioActive { playOfflineRadio() }
             }
-        }
+            if backgroundCaches[track.id] == nil {
+                backgroundCacheURLs[track.id] = track.url
+                backgroundCaches[track.id] = Task { [weak self] in
+                    guard let self else { return }
+                    defer { backgroundCaches[track.id] = nil; backgroundCacheURLs[track.id] = nil }
+                    do {
+                        try await musicClient.download(track, token: token) { [weak self] progress in
+                            Task { @MainActor [weak self] in
+                                guard let self, self.playbackAttempt == attempt, self.loadingTrackID == track.id else { return }
+                                self.downloadProgress.update(progress, for: track.id)
+                            }
+                        }
+                        try Task.checkCancellation()
+                        if let metadata = try? await TrackImporter.read(track.url) { applyDownloadedMetadata(metadata, to: track.id) }
+                        invalidateLibraryQueries(); scheduleSave()
+                    } catch {
+                        if !Task.isCancelled { showNotice("歌曲正在播放，但离线缓存未完成：" + error.localizedDescription, error: true) }
+                    }
+                }
+            }
+        } catch { loadingTrackID = nil; showNotice("无法准备云端播放：" + error.localizedDescription, error: true) }
     }
 
     @Published private(set) var radioUsesLocalSongs = false
-
     var radioTrack: Track? { track(for: radioTrackID) }
     var isRadioBuffering: Bool { isRadioLoading || (isRadioActive && loadingTrackID != nil) }
 
@@ -743,11 +794,12 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func nextRadioTrack() {
-        guard !isManagingStorage else { return }
+        guard !playbackBlockedByStorage else { return }
         let wasActive = isRadioActive
         cancelRadioRequest()
         cancelAudioDownload()
         let previousSource = radioTrack?.source(on: configuredServer)
+        endStreamPlayback()
         audioPlayer?.stop()
         audioPlayer = nil
         isPlaying = false
@@ -983,7 +1035,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func playTrack(_ id: UUID, in source: [UUID]? = nil) {
-        guard !isManagingStorage else { return }
+        guard !playbackBlockedByStorage else { return }
         endRadio()
         var ids = source ?? visibleTracks.map(\.id)
         if !ids.contains(id) { ids = [id] }
@@ -994,7 +1046,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func playAll(shuffle: Bool = false) {
-        guard !isManagingStorage else { return }
+        guard !playbackBlockedByStorage else { return }
         if section == .radio { nextRadioTrack(); return }
         endRadio()
         var ids = visibleTracks.map(\.id)
@@ -1010,12 +1062,19 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func resume() {
-        guard !isManagingStorage else { return }
+        guard !playbackBlockedByStorage else { return }
         guard !isPlaying else { return }
         if isRadioLoading { return }
         if isRadioActive && currentTrack == nil { nextRadioTrack(); return }
         guard loadingTrackID == nil else { return }
         guard currentTrack != nil else { playAll(); return }
+        if let player = streamPlayer {
+            if player.currentItem?.status == .failed { endStreamPlayback(); loadCurrent(autoplay: true); return }
+            streamWantsPlayback = true
+            if player.currentItem?.status == .readyToPlay { player.play(); playbackDidStart(successfully: true) }
+            else { loadingTrackID = currentTrack?.id }
+            updateNowPlaying(); scheduleSave(); return
+        }
         guard let audioPlayer else { loadCurrent(autoplay: true); return }
         if audioPlayer.currentTime >= audioPlayer.duration - 0.1 {
             audioPlayer.currentTime = 0
@@ -1030,6 +1089,12 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     func pause() {
         cancelRadioRequest()
         if isRadioActive { radioMessage = "电台已暂停，随时继续收听。" }
+        if let player = streamPlayer {
+            streamWantsPlayback = false; player.pause(); loadingTrackID = nil; downloadProgress.reset()
+            let position = player.currentTime().seconds
+            if position.isFinite { elapsed = position }
+            isPlaying = false; updateNowPlaying(); scheduleSave(); return
+        }
         cancelAudioDownload()
         audioPlayer?.pause()
         isPlaying = false
@@ -1042,6 +1107,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         cancelRadioRequest()
         if isRadioActive { radioMessage = "电台已停止，可以继续收听或换一首。" }
         cancelAudioDownload()
+        endStreamPlayback()
         audioPlayer?.stop()
         audioPlayer?.currentTime = 0
         isPlaying = false
@@ -1052,12 +1118,12 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func next(automatic: Bool = false) {
-        guard !isManagingStorage else { return }
+        guard !playbackBlockedByStorage else { return }
         if isRadioActive { nextRadioTrack(); return }
         if queue.advance(mode: mode, automatic: automatic) { loadCurrent(autoplay: true) }
         else {
             if automatic { elapsed = playbackDuration }
-            audioPlayer?.pause()
+            audioPlayer?.pause(); streamPlayer?.pause(); streamWantsPlayback = false
             isPlaying = false
             updateNowPlaying()
             scheduleSave()
@@ -1065,7 +1131,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func previous() {
-        guard !isManagingStorage else { return }
+        guard !playbackBlockedByStorage else { return }
         if isRadioActive { seek(to: 0); return }
         if elapsed > 3 { seek(to: 0); return }
         if queue.retreat(mode: mode) { loadCurrent(autoplay: true) }
@@ -1073,14 +1139,19 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func selectQueueIndex(_ index: Int) {
-        guard !isManagingStorage else { return }
+        guard !playbackBlockedByStorage else { return }
         guard queue.ids.indices.contains(index) else { return }
         queue.select(index)
         loadCurrent(autoplay: true)
     }
 
     func seek(to time: Double) {
-        guard let audioPlayer, time.isFinite else { return }
+        guard time.isFinite else { return }
+        if let player = streamPlayer {
+            elapsed = min(max(0, time), max(0, playbackDuration)); player.seek(to: CMTime(seconds: elapsed, preferredTimescale: 600))
+            updateNowPlaying(); scheduleSave(); return
+        }
+        guard let audioPlayer else { return }
         audioPlayer.currentTime = min(max(0, time), audioPlayer.duration)
         elapsed = audioPlayer.currentTime
         updateNowPlaying()
@@ -1104,15 +1175,20 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func tick() {
-        guard isPlaying, let audioPlayer else { return }
-        elapsed = audioPlayer.currentTime
+        guard isPlaying else { return }
+        if let player = streamPlayer {
+            let position = player.currentTime().seconds, duration = player.currentItem?.duration.seconds ?? 0
+            if position.isFinite { elapsed = position }
+            if duration.isFinite && duration > 0 { playbackDuration = duration }
+        } else if let audioPlayer { elapsed = audioPlayer.currentTime } else { return }
         let second = Int(elapsed)
         if second != lastNowPlayingSecond { lastNowPlayingSecond = second; updateNowPlaying() }
     }
 
     private func loadCurrent(autoplay: Bool, at position: Double = 0) {
-        guard !isManagingStorage else { return }
+        guard !playbackBlockedByStorage else { return }
         cancelAudioDownload()
+        endStreamPlayback()
         audioPlayer?.stop()
         audioPlayer = nil
         isPlaying = false
@@ -1187,7 +1263,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func enqueueNext(_ id: UUID) {
-        guard !isManagingStorage else { return }
+        guard !playbackBlockedByStorage else { return }
         endRadio()
         let hadCurrent = queue.currentID != nil
         queue.insertNext(id)
@@ -1233,18 +1309,70 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         showNotice("已从曲库移除，原始音乐文件已保留。")
     }
 
-    private func prepareStorageChange(stopping ids: Set<UUID>, cancelConnection: Bool = true) async {
+    func checkInvalidSongs() async {
+        guard !isCheckingInvalidSongs, !isManagingStorage else { return }
+        isCheckingInvalidSongs = true
+        defer { isCheckingInvalidSongs = false }
+        let snapshot = tracks.filter { $0.remoteSource == nil }
+        let evidence = await Task.detached(priority: .utility) {
+            var found: [InvalidTrackEvidence] = []
+            for track in snapshot {
+                if Task.isCancelled { break }
+                if let invalid = await TrackImporter.invalidEvidence(for: track) { found.append(invalid) }
+            }
+            return found
+        }.value
+        guard !isManagingStorage else { showNotice("检测完成，但当前正在处理歌曲，请稍后重新检测。", error: true); return }
+        var invalid = Set<UUID>(), linked: [UUID: RemoteTrackSource] = [:]
+        for item in evidence {
+            guard let track = track(for: item.id), track.remoteSource == nil, track.url == item.url, item.stillMatches() else { continue }
+            if let source = track.source(on: configuredServer) ?? track.cloudSources.first { linked[item.id] = source }
+            else { invalid.insert(item.id) }
+        }
+        let affected = invalid.union(linked.keys)
+        guard !affected.isEmpty else { showNotice("检测完成：未发现可确认无效的本地歌曲，无法读取的文件已跳过。"); return }
+        let wasCurrent = queue.currentID.map { affected.contains($0) } ?? false
+        if wasCurrent { stop(); audioPlayer = nil }
+        tracks = tracks.compactMap { track in
+            if invalid.contains(track.id) { return nil }
+            guard let source = linked[track.id] else { return track }
+            var updated = track
+            updated.remoteSource = source
+            updated.cloudSources.removeAll { $0 == source }
+            updated.url = musicCacheURL.appendingPathComponent("\(track.id.uuidString)-\(source.sha256).\(track.url.pathExtension.lowercased())")
+            return updated
+        }
+        onlineIDs.subtract(invalid)
+        radioUpcomingIDs.removeAll { invalid.contains($0) }
+        for index in playlists.indices { playlists[index].trackIDs.removeAll { invalid.contains($0) } }
+        queue.remove(invalid)
+        if let id = selectedTrackID, invalid.contains(id) { selectedTrackID = nil }
+        if wasCurrent { loadCurrent(autoplay: false) }
+        scheduleSave()
+        showNotice("检测完成：已移除 \(invalid.count) 首无效歌曲，保留 \(linked.count) 首的云端副本。原始文件未删除。")
+    }
+
+    private func prepareStorageChange(stopping ids: Set<UUID>, cancelConnection: Bool = true, allCaches: Bool = false) async {
         if cancelConnection {
             connectionAttempt = UUID(); connectionTask?.cancel(); isConnecting = false
         }
-        let audioTask = audioDownloadTask, upcoming = upcomingCacheTask, pendingRadio = radioTask
-        cancelRadioRequest(); cancelUpcomingCache(); cancelAudioDownload()
+        let stopCurrent = allCaches || currentTrack.map { ids.contains($0.id) } == true
+        let audioTask = stopCurrent ? audioDownloadTask : nil, upcoming = upcomingCacheTask, pendingRadio = radioTask
+        let selected = backgroundCaches.filter { allCaches || ids.contains($0.key) }
+        let caches = Array(selected.values)
+        let urls = Set(ids.compactMap { backgroundCacheURLs[$0] ?? track(for: $0)?.url })
+        for id in selected.keys { backgroundCaches[id] = nil; backgroundCacheURLs[id] = nil }
+        caches.forEach { $0.cancel() }
+        cancelRadioRequest(); cancelUpcomingCache()
+        if stopCurrent { cancelAudioDownload() }
         if let current = currentTrack, ids.contains(current.id) {
-            audioPlayer?.stop(); audioPlayer = nil; isPlaying = false; elapsed = 0
+            endStreamPlayback(); audioPlayer?.stop(); audioPlayer = nil; isPlaying = false; elapsed = 0
             playbackDuration = 0; isRadioActive = false; updateNowPlaying()
         }
-        await musicClient.cancelDownloads()
-        await audioTask?.value; await upcoming?.value; await pendingRadio?.value
+        await musicClient.cancelDownloads(urls: allCaches ? nil : urls)
+        await audioTask?.value; await pendingRadio?.value
+        if allCaches { await upcoming?.value }
+        for task in caches { await task.value }
     }
 
     private func cacheFiles() throws -> [URL] {
@@ -1280,7 +1408,9 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 guard let source else { throw OnlineLibraryError.message("请切换到这首歌曲所属的服务器后删除。") }
                 try await musicClient.delete(source, token: connectionToken)
             }
-            await prepareStorageChange(stopping: (localFile || song.remoteSource != nil) ? [id] : [])
+            var stopping: Set<UUID> = (localFile || song.remoteSource != nil) ? [id] : []
+            if fromCloud, let source { stopping.insert(source.cacheID) }
+            await prepareStorageChange(stopping: stopping)
             if fromCloud {
                 if let source { try removeSourceCaches(source) }
                 // Remove every reference to this cloud copy, retaining local originals.
@@ -1309,7 +1439,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         guard !isManagingStorage else { return }
         isManagingStorage = true; storageMessage = "正在清空缓存…"
         defer { isManagingStorage = false; storageMessage = ""; scheduleSave() }
-        await prepareStorageChange(stopping: Set(tracks.filter { $0.remoteSource != nil }.map(\.id)))
+        await prepareStorageChange(stopping: Set(tracks.filter { $0.remoteSource != nil }.map(\.id)), allCaches: true)
         do {
             let files = try cacheFiles()
             for file in files { try FileManager.default.removeItem(at: file) }
@@ -1325,12 +1455,33 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         return files.reduce(0) { $0 + Int64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
     }
 
-    private func uploadSong(_ id: UUID, server: URL, token: String) async throws -> UUID {
+    private func uploadSongShared(_ id: UUID, server: URL, token: String, number: Int, total: Int, attempt: UUID) async throws -> UUID {
+        let key = server.absoluteString + "|" + id.uuidString
+        if let task = songUploadTasks[key] { return try await task.value }
+        let task = Task { try await uploadSong(id, server: server, token: token, number: number, total: total, attempt: attempt) }
+        songUploadTasks[key] = task
+        defer { songUploadTasks[key] = nil }
+        return try await task.value
+    }
+
+    private func uploadSong(_ id: UUID, server: URL, token: String, number: Int, total: Int, attempt: UUID) async throws -> UUID {
         guard let song = track(for: id) else { throw OnlineLibraryError.message("歌曲已被移除。") }
         if let source = song.source(on: server) { return source.id }
         guard song.remoteSource == nil else { throw OnlineLibraryError.message("《\(song.title)》属于另一台服务器，请切换到该服务器后上传歌单。") }
         guard song.hasLocalCopy else { throw OnlineLibraryError.message("《\(song.title)》尚无本地文件，请先缓存后再上传。") }
-        let record = try await musicClient.upload(song, server: server, token: token)
+        storageMessage = "准备上传 \(number) / \(total)：\(song.title)"
+        uploadFraction = 0; uploadProgressSongID = id
+        defer { if uploadProgressSongID == id { uploadProgressSongID = nil } }
+        let record = try await musicClient.upload(song, server: server, token: token) { [weak self] progress in
+            Task { @MainActor [weak self] in
+                guard let self, self.uploadAttempt == attempt, self.uploadProgressSongID == id, self.isManagingStorage else { return }
+                let fraction = progress.fraction
+                if let previous = self.uploadFraction, Int(previous * 100) == progress.percentage { return }
+                self.uploadFraction = fraction
+                self.storageMessage = fraction >= 1 ? "已发送 \(number) / \(total)：\(song.title)，等待服务器处理…" : "上传 \(number) / \(total)：\(song.title) · \(progress.percentage)%"
+            }
+        }
+        uploadFraction = nil
         let remote = try record.track(server: server, cacheRoot: musicCacheURL)
         guard let source = remote.remoteSource, let index = position(of: id) else { throw CancellationError() }
         tracks[index].cloudSources.removeAll { $0.server == server }
@@ -1354,17 +1505,30 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func uploadToCloud(trackID: UUID? = nil, playlistID: UUID? = nil) async {
-        guard !isManagingStorage else { return }
-        isManagingStorage = true; storageMessage = "正在上传云端…"
-        defer { isManagingStorage = false; storageMessage = "" }
+        guard !isManagingStorage || isUploading else { return }
+        activeUploads += 1
+        isUploading = true; isManagingStorage = true; storageMessage = "正在上传云端…"
+        let attempt = UUID(); uploadAttempt = attempt
+        defer {
+            activeUploads -= 1
+            if activeUploads == 0 {
+                uploadAttempt = UUID(); uploadProgressSongID = nil; uploadFraction = nil
+                isManagingStorage = false; isUploading = false; storageMessage = ""
+            }
+        }
         connectionAttempt = UUID(); connectionTask?.cancel(); isConnecting = false
         do {
             let server = try OnlineSettings.serverURL(onlineSettings.server), token = connectionToken
             if let playlistID, let list = playlists.first(where: { $0.id == playlistID }) {
-                var ids: [UUID] = []
-                for (offset, id) in list.trackIDs.enumerated() {
-                    storageMessage = "上传歌单：\(offset + 1) / \(list.trackIDs.count)"
-                    ids.append(try await uploadSong(id, server: server, token: token))
+                let ids = try await withThrowingTaskGroup(of: (Int, UUID).self) { group in
+                    for (offset, id) in list.trackIDs.enumerated() {
+                        group.addTask { @MainActor in
+                            (offset, try await self.uploadSongShared(id, server: server, token: token, number: offset + 1, total: list.trackIDs.count, attempt: attempt))
+                        }
+                    }
+                    var results = Array<UUID?>(repeating: nil, count: list.trackIDs.count)
+                    for try await (offset, id) in group { results[offset] = id }
+                    return results.compactMap { $0 }
                 }
                 let uploaded = try await musicClient.uploadPlaylist(list, trackIDs: ids, server: server, token: token)
                 var lists = onlinePlaylistCache[server.absoluteString] ?? []
@@ -1372,7 +1536,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 mergeOnlinePlaylists(lists, server: server)
                 showNotice("已上传歌单「\(list.name)」，云端按本地歌单顺序播放。")
             } else if let trackID {
-                _ = try await uploadSong(trackID, server: server, token: token)
+                _ = try await uploadSongShared(trackID, server: server, token: token, number: 1, total: 1, attempt: attempt)
                 showNotice("歌曲已上传云端。")
             }
             invalidateLibraryQueries(); scheduleSave()
@@ -1450,7 +1614,7 @@ final class PlayerModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func snapshotForSaving() -> LibrarySnapshot {
-        let position = isPlaying ? (audioPlayer?.currentTime ?? elapsed) : elapsed
+        let position = isPlaying ? (streamPlayer?.currentTime().seconds ?? audioPlayer?.currentTime ?? elapsed) : elapsed
         return LibrarySnapshot(tracks: tracks, playlists: playlists, queue: queue,
                                mode: mode, volume: volume, elapsed: position, onlinePlaylists: onlinePlaylistCache)
     }

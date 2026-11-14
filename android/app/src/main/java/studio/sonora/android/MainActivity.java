@@ -30,10 +30,10 @@ public final class MainActivity extends Activity implements Repository.Listener,
     private final TextView[] navLabels = new TextView[4];
     private final ImageView[] navIcons = new ImageView[4];
     private TextView connectionStatus, librarySummary, libraryEmpty, miniTitle, miniArtist, radioTitle, radioArtist, radioAlbum, radioHint, radioBadge, settingsStatus, cacheSize;
-    private ProgressBar miniProgress;
+    private ProgressBar miniProgress, uploadProgress;
     private Ui.Art miniArt, radioArt;
     private ImageButton miniPlay, radioHeart;
-    private Button radioPlay;
+    private Button radioPlay, checkInvalidButton;
     private final Button[] chips = new Button[3];
     private SongAdapter libraryAdapter, playlistAdapter;
     private LinearLayout playlistsBody;
@@ -96,7 +96,10 @@ public final class MainActivity extends Activity implements Repository.Listener,
         LinearLayout brand = Ui.column(this); TextView title = Ui.text(this, "声屿", 22, Ui.TEXT); title.setTypeface(null, Typeface.BOLD);
         brand.addView(title); TextView english = Ui.text(this, "S O N O R A", 8, Ui.MUTED); brand.addView(english); header.addView(brand, Ui.weight());
         ImageButton refresh = Ui.icon(this, R.drawable.ic_refresh, "刷新在线曲库", v -> repo.refresh()); header.addView(refresh); root.addView(header);
-        connectionStatus = Ui.text(this, repo.status, 11, Ui.MUTED); Ui.padding(connectionStatus, 24, 0); connectionStatus.setMaxLines(2); connectionStatus.setOnClickListener(v -> selectTab(SETTINGS, false)); root.addView(connectionStatus); root.addView(Ui.space(this, 8));
+        connectionStatus = Ui.text(this, repo.status, 11, Ui.MUTED); Ui.padding(connectionStatus, 24, 0); connectionStatus.setMaxLines(2); connectionStatus.setOnClickListener(v -> selectTab(SETTINGS, false)); root.addView(connectionStatus);
+        uploadProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal); uploadProgress.setMax(100); uploadProgress.setVisibility(View.GONE); uploadProgress.setProgressTintList(ColorStateList.valueOf(Ui.ACCENT));
+        LinearLayout.LayoutParams uploadParams = new LinearLayout.LayoutParams(-1, Ui.dp(this, 4)); uploadParams.setMargins(Ui.dp(this, 24), Ui.dp(this, 5), Ui.dp(this, 24), 0); root.addView(uploadProgress, uploadParams);
+        root.addView(Ui.space(this, 8));
     }
     private void buildNavigation() {
         navigation = Ui.row(this); Ui.padding(navigation, 8, 7); navigation.setBackgroundColor(Ui.BG);
@@ -136,7 +139,8 @@ public final class MainActivity extends Activity implements Repository.Listener,
         LinearLayout filters = Ui.row(this); String[] names = {"全部音乐", "我的喜欢", "已缓存"};
         for (int i = 0; i < 3; i++) { int value = i; Button chip = Ui.button(this, names[i], false, v -> { filter = value; renderSongs(); }); chip.setTextSize(12); chip.setMinWidth(0); LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, Ui.dp(this, 44), 1); if (i > 0) lp.leftMargin = Ui.dp(this, 7); filters.addView(chip, lp); chips[i] = chip; }
         page.addView(Ui.space(this, 12)); page.addView(filters);
-        LinearLayout actions = Ui.row(this); actions.addView(Ui.text(this, "为此刻，选一首。", 11, Ui.MUTED), Ui.weight());
+        LinearLayout actions = Ui.row(this);
+        checkInvalidButton = Ui.button(this, "检测无效歌曲", false, v -> repo.checkInvalidSongs()); checkInvalidButton.setTextSize(11); actions.addView(checkInvalidButton, Ui.weight());
         Button playAll = Ui.button(this, "▶ 播放全部", false, v -> { if (!libraryAdapter.values.isEmpty()) play(libraryAdapter.values.get(0), libraryAdapter.values); });
         playAll.setTextSize(12); actions.addView(playAll); page.addView(actions); page.addView(Ui.space(this, 6));
         FrameLayout listContainer = new FrameLayout(this); ListView list = list(); libraryAdapter = new SongAdapter(null); list.setAdapter(libraryAdapter);
@@ -270,7 +274,7 @@ public final class MainActivity extends Activity implements Repository.Listener,
         }
     }
     private void renderCatalog() {
-        connectionStatus.setText(repo.refreshing ? getString(R.string.connection_refreshing, repo.status) : repo.status); connectionStatus.setTextColor(repo.online ? Ui.ACCENT : Ui.MUTED);
+        renderStatus();
         if (tab == LIBRARY) renderSongs();
         else if (tab == PLAYLISTS) {
             Repository.Playlist selected = playlistId == null ? null : repo.playlist(playlistId);
@@ -280,10 +284,17 @@ public final class MainActivity extends Activity implements Repository.Listener,
                 playlistAdapter.replace(values); playlistTitle.setText(selected.name); playlistSummary.setText(getString(R.string.playlist_summary, values.size(), selected.keys.size()));
             } else renderPlaylists();
         }
-        if (settingsStatus != null) settingsStatus.setText(repo.status);
         if (cacheSize != null) cacheSize.setText(String.format(Locale.CHINA, "在线歌曲缓存 %.1f MB · 本地音乐会单独保留", repo.cachedBytes() / 1048576.0));
     }
+    private void renderStatus() {
+        uploadProgress.setVisibility(repo.uploadPercent < 0 ? View.GONE : View.VISIBLE);
+        if (repo.uploadPercent >= 0) uploadProgress.setProgress(repo.uploadPercent);
+        connectionStatus.setText(repo.refreshing ? getString(R.string.connection_refreshing, repo.status) : repo.status); connectionStatus.setTextColor(repo.online ? Ui.ACCENT : Ui.MUTED);
+        if (settingsStatus != null) settingsStatus.setText(repo.status);
+        if (checkInvalidButton != null) { checkInvalidButton.setText(repo.checkingInvalidSongs ? "检测中…" : "检测无效歌曲"); checkInvalidButton.setEnabled(!repo.checkingInvalidSongs && !repo.storageBusy); }
+    }
     @Override public void changed(boolean settingsChanged) { renderCatalog(); renderPlayback(false); }
+    @Override public void progressChanged() { renderStatus(); }
     @Override public void playbackChanged(boolean songChanged) { renderPlayback(songChanged); }
     private void command(String action) { dispatch(new Intent(this, PlaybackService.class).setAction(action)); }
     private void dispatch(Intent intent) {
@@ -419,12 +430,12 @@ public final class MainActivity extends Activity implements Repository.Listener,
             String description = song.cached ? getString(R.string.song_cached, song.artist) : song.artist;
             holder.subtitle.setText(song.plays > 0 ? getString(R.string.song_play_count, description, song.plays) : description);
             boolean current = service != null && song.key.equals(service.currentKey); holder.title.setTextColor(current ? Ui.ACCENT : Ui.TEXT);
-            holder.root.setBackground(Ui.round(MainActivity.this, current ? 0xff1c261c : Ui.BG, 12));
+            holder.root.setBackground(current ? holder.currentBackground : holder.normalBackground);
             holder.heart.setImageResource(song.favorite ? R.drawable.ic_heart_fill : R.drawable.ic_heart); holder.heart.setImageTintList(ColorStateList.valueOf(song.favorite ? Ui.ACCENT : Ui.MUTED));
-            holder.sources.removeAllViews();
-            if (song.cached) { ImageView local = new ImageView(MainActivity.this); local.setImageResource(R.drawable.ic_local); local.setImageTintList(ColorStateList.valueOf(Ui.MUTED)); holder.sources.addView(local, new LinearLayout.LayoutParams(Ui.dp(MainActivity.this, 15), Ui.dp(MainActivity.this, 15))); }
-            if (song.hasCloud()) { ImageView cloudIcon = new ImageView(MainActivity.this); cloudIcon.setImageResource(R.drawable.ic_cloud); cloudIcon.setImageTintList(ColorStateList.valueOf(Ui.ACCENT)); holder.sources.addView(cloudIcon, new LinearLayout.LayoutParams(Ui.dp(MainActivity.this, 18), Ui.dp(MainActivity.this, 15))); }
+            holder.localSource.setVisibility(song.cached ? View.VISIBLE : View.GONE);
+            holder.cloudSource.setVisibility(song.hasCloud() ? View.VISIBLE : View.GONE);
             holder.sources.setContentDescription(song.cached && song.hasCloud() ? "本地与云端都有" : song.hasCloud() ? "云端歌曲" : "本地歌曲");
+            holder.upload.setVisibility(song.local() ? View.VISIBLE : View.GONE); holder.upload.setEnabled(!repo.storageBusy || repo.uploading); holder.upload.setContentDescription("上传云端 " + song.title); holder.upload.setOnClickListener(v -> repo.uploadToCloud(song.key, null));
             holder.delete.setEnabled(!repo.storageBusy); holder.delete.setOnClickListener(v -> confirmDeleteSong(song));
             holder.heart.setContentDescription((song.favorite ? "取消喜欢 " : "喜欢 ") + song.title); holder.heart.setOnClickListener(v -> repo.toggleFavorite(song.key)); holder.more.setOnClickListener(v -> songMenu(v, song, playlist));
             holder.root.setOnClickListener(v -> play(song, values)); return convert;
@@ -432,13 +443,17 @@ public final class MainActivity extends Activity implements Repository.Listener,
         private final class Row {
             final LinearLayout root = Ui.row(MainActivity.this);
             final LinearLayout sources = Ui.row(MainActivity.this);
-            final ImageButton delete = Ui.icon(MainActivity.this, R.drawable.ic_delete, "删除歌曲", null);
+            final android.graphics.drawable.Drawable normalBackground = Ui.round(MainActivity.this, Ui.BG, 12), currentBackground = Ui.round(MainActivity.this, 0xff1c261c, 12);
+            final ImageView localSource = new ImageView(MainActivity.this), cloudSource = new ImageView(MainActivity.this);
+            final ImageButton delete = Ui.icon(MainActivity.this, R.drawable.ic_delete, "删除歌曲", null), upload = Ui.icon(MainActivity.this, R.drawable.ic_upload, "上传云端", null);
             final Ui.Art art = new Ui.Art(MainActivity.this, 48);
             final TextView title = Ui.text(MainActivity.this, "", 15, Ui.TEXT), subtitle = Ui.text(MainActivity.this, "", 11, Ui.MUTED);
             final ImageButton heart = Ui.icon(MainActivity.this, R.drawable.ic_heart, "喜欢", null), more = Ui.icon(MainActivity.this, R.drawable.ic_more, "歌曲操作", null);
             Row() {
+                localSource.setImageResource(R.drawable.ic_local); localSource.setImageTintList(ColorStateList.valueOf(Ui.MUTED)); sources.addView(localSource, new LinearLayout.LayoutParams(Ui.dp(MainActivity.this, 15), Ui.dp(MainActivity.this, 15)));
+                cloudSource.setImageResource(R.drawable.ic_cloud); cloudSource.setImageTintList(ColorStateList.valueOf(Ui.ACCENT)); sources.addView(cloudSource, new LinearLayout.LayoutParams(Ui.dp(MainActivity.this, 18), Ui.dp(MainActivity.this, 15)));
                 Ui.padding(root, 5, 9); root.addView(art); LinearLayout copy = Ui.column(MainActivity.this); Ui.padding(copy, 11, 0);
-                title.setSingleLine(true); title.setEllipsize(TextUtils.TruncateAt.END); subtitle.setSingleLine(true); subtitle.setEllipsize(TextUtils.TruncateAt.END); copy.addView(title); copy.addView(Ui.space(MainActivity.this, 6)); copy.addView(subtitle); copy.addView(sources); root.addView(copy, Ui.weight()); root.addView(heart); root.addView(delete); root.addView(more);
+                title.setSingleLine(true); title.setEllipsize(TextUtils.TruncateAt.END); subtitle.setSingleLine(true); subtitle.setEllipsize(TextUtils.TruncateAt.END); copy.addView(title); copy.addView(Ui.space(MainActivity.this, 6)); copy.addView(subtitle); copy.addView(sources); root.addView(copy, Ui.weight()); root.addView(upload); root.addView(heart); root.addView(delete); root.addView(more);
             }
         }
     }

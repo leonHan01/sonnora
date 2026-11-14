@@ -83,7 +83,7 @@ struct PlaylistsView: View {
                 if online {
                     Button("管理在线歌单", action: model.openOnlineManagement)
                 } else {
-                    Button("一键上传云端", systemImage: "icloud.and.arrow.up") { Task { await model.uploadToCloud(playlistID: list.id) } }.disabled(model.isManagingStorage)
+                    Button("一键上传云端", systemImage: "icloud.and.arrow.up") { Task { await model.uploadToCloud(playlistID: list.id) } }.disabled(model.isManagingStorage && !model.isUploading)
                     Button("重命名歌单") { model.playlistEditor = .rename(list.id) }
                     Button("删除歌单", role: .destructive) { model.deletePlaylist(list.id) }
                 }

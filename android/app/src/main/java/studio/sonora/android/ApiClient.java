@@ -90,6 +90,47 @@ public final class ApiClient {
             try (InputStream in = connection.getInputStream()) { Core.cache(in, file, song.size, song.sha256, progress); }
         } finally { close(connection); }
     }
+    public int readRange(Connection settings, Song song, long position, byte[] output, int offset, int length) throws IOException {
+        if (!settings.server.equals(song.server)) throw new Failure("歌曲来自其他服务器，请重新选择");
+        if (position < 0 || offset < 0 || length < 0 || offset > output.length - length) throw new IOException("读取范围无效");
+        if (length == 0) return 0;
+        if (position >= song.size) return -1;
+        int count = (int)Math.min(Math.min((long)length, 128 * 1024L), song.size - position);
+        long end = position + count - 1;
+        HttpURLConnection connection = open(settings, "/api/music/tracks/" + UUID.fromString(song.remoteId) + "/audio", 20000);
+        try {
+            connection.setRequestProperty("Range", "bytes=" + position + "-" + end);
+            int code = connection.getResponseCode();
+            if (code != 206) { if (code != 200) check(code); throw new Failure("服务器不支持分段播放"); }
+            if (!("bytes " + position + "-" + end + "/" + song.size).equals(connection.getHeaderField("Content-Range"))) throw new Failure("音频分段响应无效");
+            try (InputStream input = connection.getInputStream()) {
+                int read = 0;
+                while (read < count) { int n = input.read(output, offset + read, count - read); if (n < 0) throw new EOFException("音频分段不完整"); read += n; }
+                return read;
+            }
+        } finally { close(connection); }
+    }
+    public void downloadProgressively(Connection settings, Song song, ProgressiveCache cache, Core.Progress progress) throws IOException {
+        if (!settings.server.equals(song.server)) throw new Failure("歌曲来自其他服务器，请重新选择");
+        HttpURLConnection connection = open(settings, "/api/music/tracks/" + UUID.fromString(song.remoteId) + "/audio", 20000);
+        try {
+            check(connection.getResponseCode());
+            long length = connection.getContentLengthLong();
+            if (length > Core.MAX_AUDIO || (length >= 0 && length != song.size)) throw new Failure("下载文件大小不符");
+            long total = 0;
+            try (InputStream in = connection.getInputStream()) {
+                byte[] buffer = new byte[32768]; int read;
+                while ((read = in.read(buffer)) != -1) {
+                    if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException();
+                    cache.append(buffer, 0, read); total += read;
+                    if (progress != null) progress.changed(total);
+                }
+            }
+            if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException();
+            cache.finish();
+        } catch (IOException error) { cache.fail(error); throw error; }
+        finally { close(connection); }
+    }
     public void delete(Connection settings, Song song) throws IOException {
         String id = song.sourceId(settings.server);
         if (id.isEmpty()) throw new Failure("请切换到歌曲所属服务器后删除");
@@ -119,7 +160,8 @@ public final class ApiClient {
         if (!desired.equals(list.trackIds)) list = OnlinePlaylist.parse(write(settings, base + "/" + id + "/order", "PUT", new JSONObject().put("trackIds", new JSONArray(desired)).put("expectedTrackIds", new JSONArray(list.trackIds))), settings.server);
         return list;
     }
-    public Song upload(Connection settings, Song song, File file) throws IOException, JSONException {
+    public Song upload(Connection settings, Song song, File file) throws IOException, JSONException { return upload(settings, song, file, null); }
+    public Song upload(Connection settings, Song song, File file, Core.Progress progress) throws IOException, JSONException {
         long size = file.length(); if (!file.isFile() || size == 0 || size > Core.MAX_AUDIO) throw new Failure("单首歌曲不能为空且不能超过 128 MB");
         String boundary = "Sonora-" + UUID.randomUUID();
         HttpURLConnection connection = open(settings, "/api/music/tracks?reuseExisting=true", 180000);
@@ -130,7 +172,7 @@ public final class ApiClient {
                 String[][] fields = {{"title", song.title}, {"artist", song.artist}, {"album", song.album}, {"duration", Double.toString(song.duration / 1000.0)}};
                 for (String[] field : fields) output.write(("--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + field[0] + "\"\r\n\r\n" + field[1] + "\r\n").getBytes(StandardCharsets.UTF_8));
                 output.write(("--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio." + song.extension + "\"\r\nContent-Type: application/octet-stream\r\n\r\n").getBytes(StandardCharsets.UTF_8));
-                try (InputStream input = new FileInputStream(file)) { byte[] buffer = new byte[65536]; int count; while ((count = input.read(buffer)) != -1) { if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException(); output.write(buffer, 0, count); } }
+                try (InputStream input = new FileInputStream(file)) { byte[] buffer = new byte[65536]; int count; long sent = 0; if (progress != null) progress.changed(0); while ((count = input.read(buffer)) != -1) { if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException(); output.write(buffer, 0, count); sent += count; if (progress != null) progress.changed(sent); } }
                 output.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
             }
             int code = connection.getResponseCode(); if (code != 201) check(code);

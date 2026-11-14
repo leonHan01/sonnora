@@ -62,6 +62,9 @@ struct PlaybackBar: View {
                 .accessibilityLabel("定位当前歌曲：\(model.currentTrack?.title ?? "尚未播放")")
                 if let track = model.currentTrack {
                     HStack(spacing: 2) {
+                        if track.remoteSource == nil {
+                            IconButton(symbol: "icloud.and.arrow.up", help: "上传当前歌曲到云端", size: 13) { Task { await model.uploadToCloud(trackID: track.id) } }.disabled(model.isManagingStorage && !model.isUploading)
+                        }
                         IconButton(symbol: track.isFavorite ? "heart.fill" : "heart", help: track.isFavorite ? "取消收藏当前歌曲" : "收藏当前歌曲", color: track.isFavorite ? Theme.accent : Theme.secondary, size: 13) { model.toggleFavorite(track.id) }
                         PlaylistAddMenu(model: model, track: track, iconSize: 13)
                     }

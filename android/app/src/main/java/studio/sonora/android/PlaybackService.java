@@ -6,6 +6,7 @@ import android.content.pm.ServiceInfo;
 import android.media.*;
 import android.media.session.*;
 import android.os.*;
+import java.io.*;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -23,6 +24,73 @@ public final class PlaybackService extends Service implements Repository.Listene
     private final Random random = new Random();
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final ApiClient api = new ApiClient();
+    private final ExecutorService cacheWorkers = Executors.newFixedThreadPool(2);
+    private final Map<String, Transfer> transfers = new HashMap<>();
+    private StreamReader streamReader;
+    private volatile boolean destroyed;
+    private final class Transfer {
+        final Song song; final ApiClient.Connection settings; final ProgressiveCache cache; final ApiClient client = new ApiClient();
+        final CountDownLatch done = new CountDownLatch(1);
+        int readers; boolean finished;
+        Transfer(Song song, ApiClient.Connection settings) throws IOException { this.song = song; this.settings = settings; cache = new ProgressiveCache(repo.audio(song), song.size, song.sha256); }
+        void closeIfUnused() {
+            if (finished && readers == 0) {
+                transfers.remove(song.key, this);
+                try { cache.close(); } catch (IOException ignored) { }
+            }
+        }
+    }
+    private final class StreamReader extends MediaDataSource {
+        final Transfer transfer; final ApiClient ranges = new ApiClient(); volatile boolean closed; volatile IOException failure; boolean released;
+        StreamReader(Transfer transfer) { this.transfer = transfer; transfer.readers++; }
+        @Override public int readAt(long position, byte[] buffer, int offset, int size) throws IOException {
+            try {
+                if (closed) throw new InterruptedIOException("读取已取消");
+                if (position >= transfer.song.size) return -1;
+                if (transfer.cache.contains(position)) return transfer.cache.readAt(position, buffer, offset, size, () -> closed);
+                return ranges.readRange(transfer.settings, transfer.song, position, buffer, offset, size);
+            } catch (IOException error) { if (!closed) failure = error; throw error; }
+        }
+        @Override public long getSize() { return transfer.song.size; }
+        @Override public synchronized void close() {
+            if (!closed) { closed = true; ranges.cancelAll(); transfer.cache.wakeReaders(); }
+            if (Looper.myLooper() == Looper.getMainLooper()) releaseReference(); else main.post(this::releaseReference);
+        }
+        void releaseReference() {
+            synchronized (this) { if (released) return; released = true; }
+            transfer.readers--; transfer.closeIfUnused();
+        }
+    }
+    private Transfer transfer(Song song, ApiClient.Connection settings) throws IOException {
+        Transfer existing = transfers.get(song.key);
+        if (existing != null && !existing.finished) return existing;
+        Transfer created = new Transfer(song, settings); transfers.put(song.key, created);
+        cacheWorkers.submit(() -> {
+            try {
+                created.client.downloadProgressively(settings, song, created.cache, bytes -> {
+                    int percent = (int)(bytes * 100 / song.size);
+                    main.post(() -> { if (streamReader != null && streamReader.transfer == created) { downloadPercent = percent; emit(false); } });
+                });
+                Repository.Metadata metadata = repo.readMetadata(song);
+                main.post(() -> { repo.metadata(song.key, metadata); repo.emit(false); });
+            } catch (IOException error) {
+                created.cache.fail(error);
+                main.post(() -> { if (streamReader != null && streamReader.transfer == created) { repo.playbackRequestFailed(error); message = repo.status; emit(false); } });
+            } finally {
+                created.done.countDown();
+                if (destroyed) { try { created.cache.close(); } catch (IOException ignored) { } }
+                else main.post(() -> { created.finished = true; created.closeIfUnused(); });
+            }
+        });
+        return created;
+    }
+    private List<Transfer> cancelTransfers(Set<String> stopping) {
+        List<Transfer> pending = new ArrayList<>();
+        for (Transfer value : transfers.values()) if (stopping == null || stopping.contains(value.song.key)) pending.add(value);
+        for (Transfer value : pending) { value.cache.fail(new InterruptedIOException("缓存已取消")); value.client.cancelAll(); }
+        return pending;
+    }
+
     private final Handler main = new Handler(Looper.getMainLooper());
     private Repository repo;
     private AudioManager audio;
@@ -54,15 +122,19 @@ public final class PlaybackService extends Service implements Repository.Listene
 
     @Override public void onCreate() {
         super.onCreate(); repo = SonoraApp.repository(this); repo.observe(this);
-        repo.storageCleaner = (stopping, completion) -> {
-            cancel();
-            if (stopping.contains(currentKey)) { main.removeCallbacks(clock); releasePlayer(); savedPosition = 0; playing = false; radio = false; leaveForeground(true); }
-            worker.submit(() -> main.post(() -> {
+        repo.storageCleaner = (stopping, allCaches, completion) -> {
+            boolean stopCurrent = stopping.contains(currentKey) || (streamReader != null && (allCaches || stopping.contains(streamReader.transfer.song.key)));
+            if (stopCurrent) cancel();
+            List<Transfer> pending = cancelTransfers(allCaches ? null : stopping);
+            if (stopCurrent) { main.removeCallbacks(clock); releasePlayer(); savedPosition = 0; playing = false; radio = false; leaveForeground(true); }
+            worker.submit(() -> {
+                for (Transfer value : pending) { try { value.done.await(); } catch (InterruptedException error) { Thread.currentThread().interrupt(); return; } }
+                main.post(() -> {
                 completion.run();
                 queue.removeIf(key -> repo.song(key) == null);
                 if (repo.song(currentKey) == null) { currentKey = ""; duration = 0; }
                 persist(); updateSession(); emit(true);
-            }));
+            }); });
         };
         currentKey = repo.lastKey; savedPosition = repo.lastPosition; queue.addAll(repo.lastQueue);
         Song restored = current(); duration = restored == null ? 0 : restored.duration;
@@ -108,7 +180,7 @@ public final class PlaybackService extends Service implements Repository.Listene
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent == null || intent.getAction() == null) { stopSelf(); return START_NOT_STICKY; }
-        if (repo.storageBusy && !STOP.equals(intent.getAction())) return START_NOT_STICKY;
+        if (repo.storageBusy && !repo.uploading && !STOP.equals(intent.getAction())) return START_NOT_STICKY;
         String action = intent.getAction();
         if (Arrays.asList(PLAY, RADIO, TOGGLE, NEXT, PREVIOUS).contains(action)) promote();
         switch (action) {
@@ -135,11 +207,12 @@ public final class PlaybackService extends Service implements Repository.Listene
         generation++; if (task != null) task.cancel(true); task = null; api.cancelAll(); loading = false; downloadPercent = 0;
     }
     private void releasePlayer() {
+        if (streamReader != null) { streamReader.close(); streamReader = null; }
         if (player != null) { player.setOnCompletionListener(null); player.setOnPreparedListener(null); player.setOnErrorListener(null); player.release(); player = null; }
         playing = false;
     }
     private void load(String key, long position) {
-        if (repo.storageBusy) return;
+        if (repo.storageBusy && !repo.uploading) return;
         cancel(); releasePlayer(); counted = false; savedPosition = position; currentKey = key;
         Song song = current();
         if (song == null) { message = "歌曲已不可用"; idle(); return; }
@@ -150,44 +223,26 @@ public final class PlaybackService extends Service implements Repository.Listene
         ApiClient.Connection settings;
         try { settings = repo.cached(song) ? new ApiClient.Connection(repo.credentials.server(), "", repo.revision) : repo.connection(); }
         catch (Exception error) { loading = false; message = "请在设置中重新输入访问令牌"; idle(); return; }
-        task = worker.submit(() -> {
+        if (!repo.cached(song)) {
+            if (!repo.credentials.enabled() || song.local() || !song.server.equals(settings.server)) { loading = false; message = "这首歌曲还未缓存，请连接对应服务器"; idle(); return; }
             try {
-                if (!repo.cached(song)) {
-                    if (!repo.credentials.enabled() || song.local() || !song.server.equals(settings.server)) throw new ApiClient.Failure("这首歌曲还未缓存，请连接对应服务器");
-                    long[] last = {0};
-                    api.download(settings, song, repo.audio(song), bytes -> {
-                        long now = SystemClock.elapsedRealtime();
-                        if (now - last[0] > 400) {
-                            last[0] = now; int percent = (int)(bytes * 100 / song.size);
-                            main.post(() -> { if (attempt == generation) { downloadPercent = percent; message = "正在缓存歌曲 · " + percent + "%"; emit(false); notifyState(); } });
-                        }
-                    });
-                }
-                if (Thread.currentThread().isInterrupted()) return;
-                Repository.Metadata metadata = repo.readMetadata(song);
-                main.post(() -> {
-                    if (attempt != generation || revision != repo.revision) return;
-                    repo.metadata(song.key, metadata); prepare(song, position, attempt);
-                });
-            } catch (Exception error) {
-                main.post(() -> {
-                    if (attempt != generation || revision != repo.revision) return;
-                    loading = false; repo.playbackRequestFailed(error); message = repo.status;
-                    if (radio) offlineRadio();
-                    else {
-                        List<Song> offline = repo.offline();
-                        if (offline.isEmpty()) idle();
-                        else { queue.clear(); for (Song item : offline) queue.add(item.key); load(queue.get(0), 0); }
-                    }
-                });
-            }
+                streamReader = new StreamReader(transfer(song, settings));
+                prepare(song, position, attempt);
+            } catch (IOException error) { loading = false; message = "无法创建歌曲缓存"; idle(); }
+            return;
+        }
+        task = worker.submit(() -> {
+            Repository.Metadata metadata = repo.readMetadata(song);
+            main.post(() -> { if (attempt == generation && revision == repo.revision) { repo.metadata(song.key, metadata); prepare(song, position, attempt); } });
         });
     }
+
     private void prepare(Song song, long position, int attempt) {
         try {
             MediaPlayer next = new MediaPlayer(); player = next;
             next.setAudioAttributes(attributes()); next.setWakeMode(this, PowerManager.PARTIAL_WAKE_LOCK);
-            next.setDataSource(repo.audio(song).getAbsolutePath());
+            if (streamReader != null) next.setDataSource(streamReader);
+            else next.setDataSource(repo.audio(song).getAbsolutePath());
             next.setOnPreparedListener(prepared -> {
                 if (attempt != generation || player != prepared) return;
                 loading = false; duration = prepared.getDuration(); savedPosition = Math.min(position, Math.max(0, duration - 100));
@@ -196,7 +251,19 @@ public final class PlaybackService extends Service implements Repository.Listene
             });
             next.setOnCompletionListener(completed -> { if (player == completed && attempt == generation) { playing = false; next(true); } });
             next.setOnErrorListener((failed, what, extra) -> {
-                if (player == failed && attempt == generation) { loading = false; releasePlayer(); message = "无法解码这首音频，请尝试其他歌曲"; idle(); }
+                if (player == failed && attempt == generation) {
+                    IOException error = streamReader == null ? null : streamReader.failure;
+                    loading = false; releasePlayer();
+                    if (error != null) {
+                        repo.playbackRequestFailed(error); message = repo.status;
+                        if (ApiClient.requiresOffline(error)) {
+                            if (radio) { offlineRadio(); return true; }
+                            List<Song> available = repo.offline();
+                            if (!available.isEmpty()) { queue.clear(); for (Song local : available) queue.add(local.key); load(queue.get(0), 0); return true; }
+                        }
+                    } else message = "无法解码这首音频，请尝试其他歌曲";
+                    idle();
+                }
                 return true;
             });
             updateMetadata(); next.prepareAsync();
@@ -214,7 +281,7 @@ public final class PlaybackService extends Service implements Repository.Listene
         } catch (IllegalStateException error) { playing = false; message = "暂时无法播放，请重新选择歌曲"; idle(); }
     }
     private void resume() {
-        if (repo.storageBusy) return;
+        if (repo.storageBusy && !repo.uploading) return;
         autoResume = false;
         if (playing || loading) return;
         if (current() == null) {
@@ -248,7 +315,7 @@ public final class PlaybackService extends Service implements Repository.Listene
     }
     public void clearDownloadedAudio() { repo.clearDownloaded(); }
     private void next(boolean automatic) {
-        if (repo.storageBusy) return;
+        if (repo.storageBusy && !repo.uploading) return;
         if (radio) { nextRadio(); return; }
         Set<String> available = new HashSet<>(); for (Song song : repo.available()) available.add(song.key);
         int oldIndex = queue.indexOf(currentKey);
@@ -260,7 +327,7 @@ public final class PlaybackService extends Service implements Repository.Listene
         else load(queue.get(nextIndex), 0);
     }
     private void previous() {
-        if (repo.storageBusy) return;
+        if (repo.storageBusy && !repo.uploading) return;
         if (radio || position() > 3000) { seek(0); return; }
         int index = queue.indexOf(currentKey);
         if (index > 0) load(queue.get(index - 1), 0);
@@ -273,7 +340,7 @@ public final class PlaybackService extends Service implements Repository.Listene
         updateSession(); persist(); emit(false);
     }
     private void enqueue(String key) {
-        if (repo.storageBusy) return;
+        if (repo.storageBusy && !repo.uploading) return;
         if (repo.song(key) == null || Objects.equals(key, currentKey)) return;
         if (radio && loading) { cancel(); releasePlayer(); }
         radio = false; queue.remove(key); int cursor = queue.indexOf(currentKey);
@@ -282,7 +349,7 @@ public final class PlaybackService extends Service implements Repository.Listene
         persist(); emit(true);
     }
     private void nextRadio() {
-        if (repo.storageBusy) return;
+        if (repo.storageBusy && !repo.uploading) return;
         boolean wasRadio = radio; Song previous = current() == null ? repo.song(lastRadioKey) : current();
         cancel(); releasePlayer(); currentKey = ""; queue.clear(); savedPosition = 0; duration = 0; radio = true;
         if (!repo.credentials.enabled() || (wasRadio && !repo.online && SystemClock.elapsedRealtime() - repo.lastNetworkAttempt < 30000)) { offlineRadio(); return; }
@@ -383,7 +450,9 @@ public final class PlaybackService extends Service implements Repository.Listene
     }
     @Override public void onTaskRemoved(Intent rootIntent) { if (!playing && !loading) stopSelf(); }
     @Override public void onDestroy() {
-        persist(); cancel(); releasePlayer(); repo.remove(this); repo.storageCleaner = null; worker.shutdownNow(); main.removeCallbacksAndMessages(null);
+        persist(); cancel(); releasePlayer(); destroyed = true;
+        for (Transfer value : cancelTransfers(null)) if (value.done.getCount() == 0) { value.finished = true; value.closeIfUnused(); }
+        cacheWorkers.shutdown(); repo.remove(this); repo.storageCleaner = null; worker.shutdownNow(); main.removeCallbacksAndMessages(null);
         audio.abandonAudioFocusRequest(focus); unregisterReceiver(noisy); session.release(); leaveForeground(true); super.onDestroy();
     }
 }
